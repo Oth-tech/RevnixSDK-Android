@@ -103,14 +103,93 @@ public data class PlacementOffering(
     val packages: List<PlacementPackage> = emptyList(),
 )
 
+/**
+ * Remote paywall design attached to a placement (REV-028). Render contract —
+ * the app draws this with its own components; prices still come from the
+ * store so the display never disagrees with the charge.
+ */
+@Serializable
+public data class PaywallConfig(
+    /**
+     * Layout — the screen structure the paywall renders. Known values:
+     * `"focus"`, `"feature-list"`, `"minimal"`, `"hero"`, `"timeline"`,
+     * `"plans"`, `"feature-grid"`, `"offer"`, `"reveal"`. Kept as a plain
+     * string so unknown future layouts decode instead of failing — render a
+     * fallback layout for values you don't recognize.
+     */
+    val template: String,
+    /** Color scheme, `"dark"` or `"light"`. Absent (legacy config) = dark. */
+    val mode: String? = null,
+    val headline: String,
+    val subheadline: String? = null,
+    val features: List<Feature> = emptyList(),
+    val ctaLabel: String,
+    /** packageId of the visually highlighted package. */
+    val highlightPackageId: String? = null,
+    /** Badge on the highlighted package, e.g. "SAVE 17%". */
+    val badgeText: String? = null,
+    /** Accent hex like "#6478ff"; fall back to the app theme when absent. */
+    val accent: String? = null,
+    /** Hero image URL rendered above the headline in place of the icon tile. */
+    val heroImageUrl: String? = null,
+    /** Social proof, dashboard-configured. Render the pieces that are set. */
+    val review: Review? = null,
+    /** Win-back/offer presentation on the highlighted package. */
+    val offer: Offer? = null,
+    /** Footer links, dashboard-configured. Absent (legacy) = show all three. */
+    val footer: Footer? = null,
+) {
+    @Serializable
+    public data class Feature(
+        val icon: String? = null,
+        val title: String,
+        val description: String? = null,
+    )
+
+    @Serializable
+    public data class Review(
+        /** 0–5; rendered as a star row. */
+        val rating: Double? = null,
+        val quote: String? = null,
+        val author: String? = null,
+        /** e.g. "Join 2M+ users" — small line under the CTA. */
+        val count: String? = null,
+    )
+
+    @Serializable
+    public data class Offer(
+        /** Anchor price struck through on the highlighted package. */
+        val strikethroughPrice: String? = null,
+        /** Urgency line above the CTA. */
+        val urgencyText: String? = null,
+    )
+
+    @Serializable
+    public data class Footer(
+        val showRestore: Boolean = true,
+        val showTerms: Boolean = true,
+        val showPrivacy: Boolean = true,
+        /** When set the SDK opens it directly; otherwise the host handles it. */
+        val termsUrl: String? = null,
+        val privacyUrl: String? = null,
+    )
+}
+
+@Serializable
+public data class PlacementPaywall(
+    val paywallId: String,
+    val name: String,
+    val config: PaywallConfig,
+)
+
 @Serializable
 public data class PlacementResolution(
     val status: String,
     val placementKey: String,
     val revision: Long,
     val offering: PlacementOffering,
-    /** Remote paywall render contract — app-rendered in v1. */
-    val paywall: JsonElement? = null,
+    /** Remote paywall attached to this placement — app-rendered in v1. */
+    val paywall: PlacementPaywall? = null,
 )
 
 /** Swallowed background failure (queue drains, telemetry beacons). */
