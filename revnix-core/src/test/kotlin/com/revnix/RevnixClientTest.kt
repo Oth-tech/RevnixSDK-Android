@@ -62,6 +62,16 @@ class RevnixClientTest {
         {"status":"ok","placementKey":"main","revision":1,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]}}
     """.trimIndent()
 
+    /** Templated paywall using the full REV-028 surface, plus an unknown key. */
+    private val paywallFullBody = """
+        {"status":"ok","placementKey":"main","revision":2,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"paywall":{"paywallId":"pw_1","name":"Summer promo","config":{"template":"reveal","mode":"light","headline":"Go Pro","subheadline":"Everything unlocked","features":[{"icon":"star","title":"All features","description":"No limits"}],"ctaLabel":"Continue","highlightPackageId":"pkg_1","badgeText":"SAVE 17%","accent":"#6478ff","heroImageUrl":"https://cdn.example/hero.png","review":{"rating":4.8,"quote":"Worth it","author":"Ana","count":"Join 2M+ users"},"offer":{"strikethroughPrice":"PKR 9,999","urgencyText":"Ends tonight"},"footer":{"showRestore":true,"showTerms":false,"showPrivacy":true,"termsUrl":"https://revnix.io/terms"},"futureKnob":true}}}
+    """.trimIndent()
+
+    /** Pre-templates config: no mode/review/offer/footer, original layout. */
+    private val paywallLegacyBody = """
+        {"status":"ok","placementKey":"main","revision":1,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"paywall":{"paywallId":"pw_0","name":"Legacy","config":{"template":"focus","headline":"Unlock","features":[{"title":"Feature one"}],"ctaLabel":"Subscribe"}}}
+    """.trimIndent()
+
     private fun entitlementsBody(expiresAt: Long?): String {
         val expiry = expiresAt?.toString() ?: "null"
         return """
@@ -328,6 +338,45 @@ class RevnixClientTest {
         client.resolvePlacement("main") // cached
         assertFailsWith<RevnixError.NotFound> { client.resolvePlacement("main") }
         Unit
+    }
+
+    // MARK: - Paywall config decoding (REV-028 templates)
+
+    @Test
+    fun `a full templated paywall config decodes typed`() = runBlocking {
+        route("/placements" to { json(200, paywallFullBody) })
+        val client = makeClient()
+        val paywall = assertNotNull(client.resolvePlacement("main").paywall)
+        assertEquals("pw_1", paywall.paywallId)
+        assertEquals("Summer promo", paywall.name)
+        val config = paywall.config
+        assertEquals("reveal", config.template)
+        assertEquals("light", config.mode)
+        assertEquals("Go Pro", config.headline)
+        assertEquals("star", config.features.single().icon)
+        assertEquals("pkg_1", config.highlightPackageId)
+        assertEquals(4.8, config.review?.rating)
+        assertEquals("Join 2M+ users", config.review?.count)
+        assertEquals("PKR 9,999", config.offer?.strikethroughPrice)
+        assertEquals("Ends tonight", config.offer?.urgencyText)
+        assertEquals(false, config.footer?.showTerms)
+        assertEquals("https://revnix.io/terms", config.footer?.termsUrl)
+        assertNull(config.footer?.privacyUrl)
+    }
+
+    @Test
+    fun `a legacy minimal paywall config still decodes`() = runBlocking {
+        route("/placements" to { json(200, paywallLegacyBody) })
+        val client = makeClient()
+        val paywall = assertNotNull(client.resolvePlacement("main").paywall)
+        val config = paywall.config
+        assertEquals("focus", config.template)
+        assertEquals("Unlock", config.headline)
+        assertEquals("Feature one", config.features.single().title)
+        assertNull(config.mode)
+        assertNull(config.review)
+        assertNull(config.offer)
+        assertNull(config.footer)
     }
 
     @Test
