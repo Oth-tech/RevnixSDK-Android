@@ -22,7 +22,7 @@ Requires Android minSdk 24 and JDK 17.
 
 ```kotlin
 dependencies {
-    implementation("com.revnix:revnix-android:0.1.0")
+    implementation("com.revnix:revnix-android:0.2.0")
 }
 ```
 

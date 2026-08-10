@@ -63,7 +63,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
         const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
         const val CACHE_CUSTOMERS = 4
-        const val SDK_VERSION = "0.1.0"
+        const val SDK_VERSION = "0.2.0"
 
         const val KEY_CUSTOMER_ID = "revnix.customerId"
         const val KEY_WALL_CLOCK = "revnix.lastWallClock"
@@ -272,8 +272,15 @@ public class RevnixClient(private val config: RevnixConfig) {
     // MARK: - Placements & telemetry
 
     public suspend fun resolvePlacement(key: String): PlacementResolution {
+        // The customer id makes experiment assignment sticky server-side
+        // (REV-219); older servers simply ignore the parameter.
+        val query = mapOf("customer" to customerId())
         try {
-            val raw = request(HttpMethod.Get, listOf("v1", "placements", key, "offering"))
+            val raw = request(
+                HttpMethod.Get,
+                listOf("v1", "placements", key, "offering"),
+                query = query,
+            )
             val resolution = decode(PlacementResolution.serializer(), raw)
             config.storage.set(placementKey(key), raw)
             return resolution
@@ -325,10 +332,15 @@ public class RevnixClient(private val config: RevnixConfig) {
         method: HttpMethod,
         segments: List<String>,
         body: JsonObject? = null,
+        query: Map<String, String> = emptyMap(),
     ): String {
         val url = buildString {
             append(config.baseUrl.trimEnd('/'))
             segments.forEach { append('/').append(encodeSegment(it)) }
+            query.entries.forEachIndexed { i, (name, value) ->
+                append(if (i == 0) '?' else '&')
+                append(encodeSegment(name)).append('=').append(encodeSegment(value))
+            }
         }
         val failuresToReport = bgFailures.takeIf { it > 0 }
 
