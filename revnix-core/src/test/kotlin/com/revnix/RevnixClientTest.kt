@@ -62,6 +62,16 @@ class RevnixClientTest {
         {"status":"ok","placementKey":"main","revision":1,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]}}
     """.trimIndent()
 
+    /** REV-219: a running experiment served this customer a sticky variant. */
+    private val placementExperimentBody = """
+        {"status":"ok","placementKey":"main","revision":3,"offering":{"offeringId":"off_2","displayName":"Variant B","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"experiment":{"key":"summer-price-test","variantId":"var_b"}}
+    """.trimIndent()
+
+    /** No experiment on the placement — the server sends an explicit null. */
+    private val placementNullExperimentBody = """
+        {"status":"ok","placementKey":"main","revision":1,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"experiment":null}
+    """.trimIndent()
+
     /** Templated paywall using the full REV-028 surface, plus an unknown key. */
     private val paywallFullBody = """
         {"status":"ok","placementKey":"main","revision":2,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"paywall":{"paywallId":"pw_1","name":"Summer promo","config":{"template":"reveal","mode":"light","headline":"Go Pro","subheadline":"Everything unlocked","features":[{"icon":"star","title":"All features","description":"No limits"}],"ctaLabel":"Continue","highlightPackageId":"pkg_1","badgeText":"SAVE 17%","accent":"#6478ff","heroImageUrl":"https://cdn.example/hero.png","review":{"rating":4.8,"quote":"Worth it","author":"Ana","count":"Join 2M+ users"},"offer":{"strikethroughPrice":"PKR 9,999","urgencyText":"Ends tonight"},"footer":{"showRestore":true,"showTerms":false,"showPrivacy":true,"termsUrl":"https://revnix.io/terms"},"futureKnob":true}}}
@@ -377,6 +387,42 @@ class RevnixClientTest {
         assertNull(config.review)
         assertNull(config.offer)
         assertNull(config.footer)
+    }
+
+    // MARK: - Experiments (REV-219)
+
+    @Test
+    fun `an experiment assignment decodes and round-trips through the cache`() = runBlocking {
+        route("/placements" to onceThen(json(200, placementExperimentBody)) { disconnect() })
+        val client = makeClient()
+        val live = client.resolvePlacement("main")
+        assertEquals("summer-price-test", live.experiment?.key)
+        assertEquals("var_b", live.experiment?.variantId)
+        assertEquals("off_2", live.offering.offeringId)
+
+        // Offline now → the cached resolution keeps the assignment.
+        val cached = client.resolvePlacement("main")
+        assertEquals("summer-price-test", cached.experiment?.key)
+        assertEquals("var_b", cached.experiment?.variantId)
+    }
+
+    @Test
+    fun `a null or absent experiment field decodes as null`() = runBlocking {
+        route("/placements" to onceThen(json(200, placementNullExperimentBody)) {
+            json(200, placementBody)
+        })
+        val client = makeClient()
+        assertNull(client.resolvePlacement("main").experiment) // explicit null
+        assertNull(client.resolvePlacement("main").experiment) // absent (older server)
+    }
+
+    @Test
+    fun `the resolve request carries the customer id for sticky assignment`() = runBlocking {
+        route("/placements" to { json(200, placementBody) })
+        val client = makeClient()
+        client.resolvePlacement("main")
+        val sent = server.takeRequest()
+        assertEquals(client.customerId(), sent.requestUrl?.queryParameter("customer"))
     }
 
     @Test

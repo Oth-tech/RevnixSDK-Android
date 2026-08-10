@@ -195,6 +195,17 @@ public data class PlacementPaywall(
     val config: PaywallConfig,
 )
 
+/**
+ * A/B experiment assignment (REV-219). The served `offering`/`paywall` are
+ * already the assigned variant's — this is attribution metadata, not something
+ * the app needs to branch on.
+ */
+@Serializable
+public data class PlacementExperiment(
+    val key: String,
+    val variantId: String,
+)
+
 @Serializable
 public data class PlacementResolution(
     val status: String,
@@ -204,6 +215,11 @@ public data class PlacementResolution(
     val offering: PlacementOffering,
     /** Remote paywall attached to this placement — app-rendered in v1. */
     val paywall: PlacementPaywall? = null,
+    /**
+     * Sticky experiment assignment for this customer; null (or absent, on
+     * older servers) when no running experiment covers the placement.
+     */
+    val experiment: PlacementExperiment? = null,
 )
 
 /** Swallowed background failure (queue drains, telemetry beacons). */

@@ -21,6 +21,7 @@ import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -66,7 +67,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
         const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
         const val CACHE_CUSTOMERS = 4
-        const val SDK_VERSION = "0.1.0"
+        const val SDK_VERSION = "0.2.0"
 
         const val KEY_CUSTOMER_ID = "revnix.customerId"
         const val KEY_WALL_CLOCK = "revnix.lastWallClock"
@@ -300,8 +301,11 @@ public class RevnixClient(private val config: RevnixConfig) {
     // MARK: - Placements & telemetry
 
     public suspend fun resolvePlacement(key: String): PlacementResolution {
+        // The customer id makes experiment assignment sticky server-side
+        // (REV-219); older servers simply ignore the parameter.
+        val query = mapOf("customer" to customerId())
         try {
-            val raw = request("GET", listOf("v1", "placements", key, "offering"))
+            val raw = request("GET", listOf("v1", "placements", key, "offering"), query = query)
             val resolution = decode(PlacementResolution.serializer(), raw)
             config.storage.set(placementKey(key), raw)
             return resolution
@@ -349,15 +353,51 @@ public class RevnixClient(private val config: RevnixConfig) {
         }
     }
 
+
+    /**
+     * Set attributes on the current customer (REV-033 v2). Attributes are what
+     * A/B-test audiences target — set `country`, `app_version`, `locale`, or
+     * any custom key you want to segment on. A null value deletes the key.
+     *
+     * Throws, unlike the fire-and-forget beacons: the next placement resolve
+     * may depend on these, so a silent failure would look like broken
+     * targeting. `email` and `username` are reserved (secret key only), and an
+     * attribute your backend already set cannot be changed from a device.
+     */
+    public suspend fun setAttributes(attributes: Map<String, Any?>) {
+        val body = buildJsonObject {
+            put(
+                "attributes",
+                buildJsonObject {
+                    attributes.forEach { (key, value) ->
+                        put(
+                            key,
+                            when (value) {
+                                null -> JsonNull
+                                is Number -> JsonPrimitive(value)
+                                is String -> JsonPrimitive(value)
+                                else -> throw IllegalArgumentException(
+                                    "Attribute \"$key\" must be a String, Number, or null")
+                            },
+                        )
+                    }
+                },
+            )
+        }
+        request("POST", listOf("v1", "customers", customerId(), "attributes"), body)
+    }
+
     // MARK: - Transport
 
     private suspend fun request(
         method: String,
         segments: List<String>,
         body: JsonObject? = null,
+        query: Map<String, String> = emptyMap(),
     ): String = withContext(Dispatchers.IO) {
         val url = config.baseUrl.toHttpUrl().newBuilder().apply {
             segments.forEach { addPathSegment(it) }
+            query.forEach { (name, value) -> addQueryParameter(name, value) }
         }.build()
 
         val builder = Request.Builder()

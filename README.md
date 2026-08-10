@@ -17,12 +17,13 @@ Requires Android minSdk 24 and JDK 17.
 |---|---|
 | `revnix-core` | Pure JVM client — entitlements, cache policy, purchases, retry queue. No Android dependency, so the resilience matrix runs as a plain JVM test task. |
 | `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`) and `AndroidStorage`. |
+| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical policy, Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
 ## Install
 
 ```kotlin
 dependencies {
-    implementation("com.revnix:revnix-android:0.1.0")
+    implementation("com.revnix:revnix-android:0.2.0")
 }
 ```
 
@@ -51,6 +52,55 @@ if (client.isEntitled("pro")) { /* … */ }
 Use the **publishable** key (`rvx_pk_…`) only. Secret keys must never ship in a
 binary, so `identify`/`alias` are deliberately not SDK methods — proxy them from
 your server (see the docs recipe).
+
+## Paywalls and A/B tests
+
+`resolvePlacement` returns the published offering plus a typed `PaywallConfig`:
+nine layouts in `template` — `focus`, `feature-list`, `minimal`, `hero`,
+`timeline`, `plans`, `feature-grid`, `offer`, `reveal` — a light/dark `mode`,
+and optional `review` (stars, quote, author, count) and `offer` (anchor price,
+urgency line) blocks. `template` is a `String` on purpose so a config published
+with a future layout still deserializes rather than failing the resolve.
+
+The resolve sends the customer id, so a running A/B test serves that
+customer's variant. The `offering` and `paywall` you get back are *already*
+the variant's — render them as-is. `experiment` is attribution metadata, null
+when no running test covers the placement:
+
+```kotlin
+val resolution = client.resolvePlacement("paywall_main")
+resolution.experiment?.let { experiment ->
+    analytics.log("paywall_shown", mapOf(
+        "experiment" to experiment.key,
+        "variant" to experiment.variantId,
+    ))
+}
+```
+
+Assignment is sticky per customer and survives identity merges.
+
+### Targeting: `setAttributes`
+
+A test can be narrowed to an audience — conditions over customer attributes.
+`setAttributes` supplies the facts those conditions read:
+
+```kotlin
+client.setAttributes(mapOf(
+    "country" to "US",
+    "app_version" to "4.2.0",
+    "lifetime_orders" to 3,
+    "stale_key" to null,   // null deletes the key
+))
+```
+
+Values must be `String`, `Number`, or `null` — anything else throws
+`IllegalArgumentException` before a request is made. This suspends until the
+write completes rather than firing and forgetting, because the next
+`resolvePlacement` may depend on it. Set an audience's attributes *before* the
+first resolve on a covered placement; eligibility is checked at that resolve.
+`email` and `username` are reserved (secret key, from your server), and an
+attribute your backend already set cannot be changed from a device — both
+reject the whole batch rather than applying part of it.
 
 ## Two Android-specific rules
 
@@ -99,16 +149,26 @@ the ledger never catches up.
 ## Tests
 
 ```sh
-./gradlew :revnix-core:test
+./gradlew :revnix-core:test     # 31 tests — the resilience matrix
+./gradlew :revnix-kmp:allTests  # 30 tests — the same matrix, Ktor transport
 ```
 
-26 tests cover the full resilience matrix against OkHttp's `MockWebServer`.
+`revnix-core` runs against OkHttp's `MockWebServer`; `revnix-kmp` runs the
+ported matrix on every configured target.
 
 The Play Billing glue needs a real Play connection and is exercised with test
-purchases in a sandbox app, not by this suite.
+purchases in a sandbox app, not by either suite.
 
 ## Not in v1
 
 - Paywall UI rendering — `resolvePlacement` ships the config, your app renders it.
 - `identify` / `alias` — server-proxied by design.
 - Amazon and other stores.
+
+## Distribution status
+
+**Not yet published.** `com.revnix:revnix-android:0.2.0` is the intended
+coordinate, but nothing is on Maven Central yet, so that dependency will not
+resolve. Until it ships, apps integrate over the
+[REST API](https://revnix.com/docs/android) — the same `/v1` contract this SDK
+speaks, so migrating later does not change the backend integration.

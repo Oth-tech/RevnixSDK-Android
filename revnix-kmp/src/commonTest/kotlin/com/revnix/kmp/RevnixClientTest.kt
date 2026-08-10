@@ -45,6 +45,16 @@ class RevnixClientTest {
         {"status":"ok","placementKey":"main","revision":1,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]}}
     """.trimIndent()
 
+    /** REV-219: a running experiment served this customer a sticky variant. */
+    private val placementExperimentBody = """
+        {"status":"ok","placementKey":"main","revision":3,"offering":{"offeringId":"off_2","displayName":"Variant B","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"experiment":{"key":"summer-price-test","variantId":"var_b"}}
+    """.trimIndent()
+
+    /** No experiment on the placement — the server sends an explicit null. */
+    private val placementNullExperimentBody = """
+        {"status":"ok","placementKey":"main","revision":1,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"experiment":null}
+    """.trimIndent()
+
     /** Templated paywall using the full REV-028 surface, plus an unknown key. */
     private val paywallFullBody = """
         {"status":"ok","placementKey":"main","revision":2,"offering":{"offeringId":"off_1","displayName":"Default","packages":[{"packageId":"pkg_1","productId":"pro.monthly"}]},"paywall":{"paywallId":"pw_1","name":"Summer promo","config":{"template":"reveal","mode":"light","headline":"Go Pro","subheadline":"Everything unlocked","features":[{"icon":"star","title":"All features","description":"No limits"}],"ctaLabel":"Continue","highlightPackageId":"pkg_1","badgeText":"SAVE 17%","accent":"#6478ff","heroImageUrl":"https://cdn.example/hero.png","review":{"rating":4.8,"quote":"Worth it","author":"Ana","count":"Join 2M+ users"},"offer":{"strikethroughPrice":"PKR 9,999","urgencyText":"Ends tonight"},"footer":{"showRestore":true,"showTerms":false,"showPrivacy":true,"termsUrl":"https://revnix.io/terms"},"futureKnob":true}}}
@@ -368,6 +378,61 @@ class RevnixClientTest {
         assertNull(config.review)
         assertNull(config.offer)
         assertNull(config.footer)
+        client.close()
+    }
+
+    // MARK: - Experiments (REV-219)
+
+    @Test
+    fun an_experiment_assignment_decodes_and_round_trips_through_the_cache() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec) { _, call ->
+            if (call == 0) ok(placementExperimentBody) else null
+        }
+        val live = client.resolvePlacement("main")
+        assertEquals("summer-price-test", live.experiment?.key)
+        assertEquals("var_b", live.experiment?.variantId)
+        assertEquals("off_2", live.offering.offeringId)
+
+        // Offline now → the cached resolution keeps the assignment.
+        val cached = client.resolvePlacement("main")
+        assertEquals("summer-price-test", cached.experiment?.key)
+        assertEquals("var_b", cached.experiment?.variantId)
+        client.close()
+    }
+
+    @Test
+    fun a_null_or_absent_experiment_field_decodes_as_null() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec) { _, call ->
+            if (call == 0) ok(placementNullExperimentBody) else ok(placementBody)
+        }
+        assertNull(client.resolvePlacement("main").experiment) // explicit null
+        assertNull(client.resolvePlacement("main").experiment) // absent (older server)
+        client.close()
+    }
+
+    @Test
+    fun the_resolve_request_carries_the_customer_id_for_sticky_assignment() = runTest {
+        var customerParam: String? = null
+        val client = RevnixClient(
+            RevnixConfig(
+                apiKey = "k",
+                baseUrl = "https://example.convex.site",
+                httpClient = HttpClient(
+                    MockEngine { request ->
+                        customerParam = request.url.parameters["customer"]
+                        respond(
+                            placementBody,
+                            HttpStatusCode.OK,
+                            headersOf("Content-Type", "application/json"),
+                        )
+                    }
+                ),
+            )
+        )
+        client.resolvePlacement("main")
+        assertEquals(client.customerId(), assertNotNull(customerParam))
         client.close()
     }
 
