@@ -16,7 +16,7 @@ Requires Android minSdk 24 and JDK 17.
 | Module | What it is |
 |---|---|
 | `revnix-core` | Pure JVM client — entitlements, cache policy, purchases, retry queue. No Android dependency, so the resilience matrix runs as a plain JVM test task. |
-| `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`) and `AndroidStorage`. |
+| `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`), `AndroidStorage`, and the `RevnixPaywallView` paywall renderer. |
 | `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy (but no `setAttributes` yet — see Targeting below), Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
 ## Install
@@ -105,6 +105,45 @@ first resolve on a covered placement; eligibility is checked at that resolve.
 attribute your backend already set cannot be changed from a device — both
 reject the whole batch rather than applying part of it.
 
+### Paywall UI: `RevnixPaywallView`
+
+`revnix-android` ships a ready renderer for that config —
+`com.revnix.android.ui.RevnixPaywallView`, a port of `revnix-react`'s
+`RevnixPaywall` kept in visual lockstep with the dashboard's paywall-builder
+preview. It is built from programmatic classic Views (zero added
+dependencies), so it also works inside Compose via `AndroidView` interop.
+Prices come from Play Billing, never from the config, so the display cannot
+disagree with the charge:
+
+```kotlin
+val resolution = client.resolvePlacement("paywall_main")
+val paywall = resolution.paywall ?: return
+
+val view = RevnixPaywallView(context)
+view.bind(
+    config = paywall.config,
+    packages = listOf(
+        // priceLabel MUST be the store's localized price (ProductDetails).
+        RevnixPaywallPackage("monthly", "Monthly", monthlyDetails.formattedPrice),
+        RevnixPaywallPackage("annual", "Annual", annualDetails.formattedPrice),
+    ),
+    onPurchase = { packageId -> billing.launchPurchase(activity, detailsFor(packageId)) },
+    onRestore = { /* replay owned purchases */ },
+    client = client,                  // reports one paywall.viewed per bind
+    placementKey = "paywall_main",
+    paywallId = paywall.paywallId,
+)
+container.addView(view)
+
+view.loading = true                   // spinner in the CTA while purchasing
+```
+
+All nine `template` layouts render (unknown future layouts fall back to the
+classic structure), `mode` picks the dark/light palette, and a
+`RevnixPaywallThemeOverride` restyles individual colors on top. Footer
+Terms/Privacy links prefer your `onTerms`/`onPrivacy` handlers and fall back
+to opening the config's URLs.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
@@ -164,7 +203,6 @@ purchases in a sandbox app, not by either suite.
 
 ## Not in v1
 
-- Paywall UI rendering — `resolvePlacement` ships the config, your app renders it.
 - `identify` / `alias` — server-proxied by design.
 - Amazon and other stores.
 
