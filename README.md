@@ -17,9 +17,12 @@ Requires Android minSdk 24 and JDK 17.
 |---|---|
 | `revnix-core` | Pure JVM client — entitlements, cache policy, purchases, retry queue. No Android dependency, so the resilience matrix runs as a plain JVM test task. |
 | `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`) and `AndroidStorage`. |
-| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical policy, Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
+| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy (but no `setAttributes` yet — see Targeting below), Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
 ## Install
+
+> Not yet published to Maven Central — build from source for now (see
+> [Distribution status](#distribution-status)).
 
 ```kotlin
 dependencies {
