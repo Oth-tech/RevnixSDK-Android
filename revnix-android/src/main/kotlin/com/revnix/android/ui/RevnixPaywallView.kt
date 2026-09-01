@@ -194,6 +194,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private var shownPackages: List<RevnixPaywallPackage> = emptyList()
     private var internalSelected: String? = null
 
+    /** Whether the last render drew a designed (block) paywall. */
+    private var blockPaywall: Boolean = false
+
     // ——— per-render references (rebuilt by render()) ———
     private val selectionAppliers = mutableListOf<(String?) -> Unit>()
     private var ctaLabelView: TextView? = null
@@ -228,7 +231,10 @@ public class RevnixPaywallView @JvmOverloads constructor(
     public var selectedPackageId: String? = null
         set(value) {
             field = value
-            applySelection()
+            // Same split as select(): a designed paywall redraws, because its
+            // selected treatment is structural and no appliers are registered
+            // on that path.
+            if (blockPaywall) render() else applySelection()
         }
 
     init {
@@ -333,7 +339,8 @@ public class RevnixPaywallView @JvmOverloads constructor(
         // published before the block builder — so anything already live
         // renders unchanged.
         val blockDoc = PaywallBlockDoc.parse(config.blocks)
-        if (blockDoc != null && renderBlocks(blockDoc, config)) return
+        blockPaywall = blockDoc != null && renderBlocks(blockDoc, config)
+        if (blockPaywall) return
 
         // Base scheme comes from the dashboard config (mode: dark|light,
         // absent = dark for legacy configs); the host's explicit override
@@ -1162,7 +1169,11 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private fun select(packageId: String) {
         internalSelected = packageId
         onSelectPackage?.invoke(packageId)
-        applySelection()
+        // A designed paywall's selected treatment is structural, not just a
+        // border: a badge and a sub-line appear, and an arbitrary
+        // `selectedStyle` merges in. So it is redrawn, while the classic
+        // layouts restyle in place through the appliers.
+        if (blockPaywall) render() else applySelection()
     }
 
     private fun applySelection() {
@@ -1361,6 +1372,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     footerTermsUrl = config.footer?.termsUrl,
                     footerPrivacyUrl = config.footer?.privacyUrl,
                     onPurchase = { id -> if (!loading) onPurchase?.invoke(id) },
+                    onSelect = { id -> select(id) },
                     onRestore = onRestore,
                     onTerms = onTerms,
                     onPrivacy = onPrivacy,

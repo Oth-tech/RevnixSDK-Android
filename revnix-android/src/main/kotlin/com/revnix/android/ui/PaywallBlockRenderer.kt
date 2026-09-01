@@ -66,6 +66,11 @@ internal class BlockContext(
     val footerTermsUrl: String?,
     val footerPrivacyUrl: String?,
     val onPurchase: (String) -> Unit,
+    /**
+     * Reports a plan card tap. Selection is the paywall's own state, so a
+     * design's plan cards work without the host wiring anything.
+     */
+    val onSelect: (String) -> Unit,
     val onRestore: (() -> Unit)?,
     val onTerms: (() -> Unit)?,
     val onPrivacy: (() -> Unit)?,
@@ -448,6 +453,9 @@ internal class PaywallBlockRenderer(
                 card.addView(badge)
             }
             applyStyle(card, if (highlighted) block.highlightStyle else block.cardStyle)
+            // The whole card is the target, not just its glyphs — a plan row
+            // is mostly padding, and tapping beside the price must select.
+            card.setOnClickListener { ctx.onSelect(pkg.packageId) }
 
             val params = if (row) {
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -496,7 +504,7 @@ internal class PaywallBlockRenderer(
                 } else {
                     block.style
                 }
-                wrapper.addView(container(block, each, style))
+                wrapper.addView(container(block, each, style, selects = each?.packageId))
             }
             return wrapper
         }
@@ -505,14 +513,28 @@ internal class PaywallBlockRenderer(
         // rather than drawn with unresolved tags.
         val index = block.packageIndex
         if (index != null && index >= ctx.packages.size) return null
-        val ctxPackage = index?.let { ctx.packages.getOrNull(it) } ?: pkg
-        return container(block, ctxPackage, block.style)
+        val pinned = index?.let { ctx.packages.getOrNull(it) }
+        val ctxPackage = pinned ?: pkg
+        // A card pinned to a package doubles as its selection target — that is
+        // how hand-styled plan rows (a highlighted annual beside a plain
+        // monthly) become tappable without a products block. It takes
+        // `selectedStyle` when selected for the same reason a repeated card
+        // does, or tapping it would change what the CTA buys with no visible
+        // answer. A card that names no package is decoration and stays inert.
+        val selected = ctx.selectedPackageId ?: ctx.packages.firstOrNull()?.packageId
+        val style = if (pinned != null && pinned.packageId == selected) {
+            (block.style ?: BlockStyle()).merging(block.selectedStyle)
+        } else {
+            block.style
+        }
+        return container(block, ctxPackage, style, selects = pinned?.packageId)
     }
 
     private fun container(
         block: PaywallBlock.Card,
         pkg: BlockPackage?,
         style: BlockStyle?,
+        selects: String? = null,
     ): View {
         val gap = dp(block.style?.gap ?: 10.0)
         val children = block.children
@@ -551,6 +573,7 @@ internal class PaywallBlockRenderer(
             }
         }
         applyStyle(group, style)
+        if (selects != null) group.setOnClickListener { ctx.onSelect(selects) }
         return group
     }
 
