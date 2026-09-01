@@ -41,6 +41,7 @@ import android.widget.FrameLayout
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.revnix.BlockAction
 import com.revnix.BlockPackage
 import com.revnix.BlockStyle
 import com.revnix.PaywallBlock
@@ -49,6 +50,7 @@ import com.revnix.RevnixBackgroundLayers
 import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBackgroundLayers
 import com.revnix.revnixBlockColor
+import com.revnix.revnixHasCloseAction
 import com.revnix.revnixParseCssGradients
 import com.revnix.revnixResolveTags
 import kotlin.math.roundToInt
@@ -74,6 +76,11 @@ internal class BlockContext(
     val onRestore: (() -> Unit)?,
     val onTerms: (() -> Unit)?,
     val onPrivacy: (() -> Unit)?,
+    /**
+     * Dismissal (REV-252). Null means the host wired none, and no close is
+     * drawn at all — a dead close button is worse than none.
+     */
+    val onClose: (() -> Unit)? = null,
 )
 
 /**
@@ -161,6 +168,10 @@ internal class PaywallBlockRenderer(
                 body.scaleX = scale
                 body.scaleY = scale
             }
+            // Added AFTER the scaled body, and never inside it, so the
+            // fallback close keeps its tap size and its distance from the
+            // screen edge whatever the device width does to the design.
+            fallbackClose()?.let { screen.addView(it) }
             return screen
         }
 
@@ -171,16 +182,52 @@ internal class PaywallBlockRenderer(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ),
         )
+        fallbackClose()?.let { screen.addView(it) }
         return screen
+    }
+
+    /**
+     * The dismiss affordance the renderer supplies itself (REV-252), or null
+     * when it should not draw one.
+     *
+     * Drawn only when the design authors no close of its own AND the host
+     * wired an `onClose` — which is what makes every paywall published before
+     * close existed dismissible without being re-authored, while a design that
+     * DOES carry a close chip never ends up showing two.
+     *
+     * Deliberately plain: it is a safety net, not a design element. Tinted
+     * from the screen's own ink rather than a fixed white, so it stays legible
+     * on a light design as well as a dark one.
+     */
+    private fun fallbackClose(): View? {
+        val onClose = ctx.onClose ?: return null
+        if (revnixHasCloseAction(doc.blocks)) return null
+        val ink = revnixBlockColor(doc.textColor, doc) ?: Color.WHITE
+        val glyph = TextView(context).apply {
+            text = "\u00d7"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextColor(ink)
+            gravity = Gravity.CENTER
+            contentDescription = "Close"
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(withAlpha(ink, 0.14))
+            }
+            setOnClickListener { onClose() }
+        }
+        glyph.layoutParams = FrameLayout.LayoutParams(dp(30.0), dp(30.0), Gravity.TOP or Gravity.END)
+            .apply { topMargin = dp(14.0); marginEnd = dp(14.0) }
+        return glyph
     }
 
     /** One block, or null when it contributes nothing. */
     private fun render(block: PaywallBlock, pkg: BlockPackage?): View? = when (block) {
         is PaywallBlock.Text -> textView(
             revnixResolveTags(block.text, pkg, ctx.packages), block.style,
-        )
+        ).also { closeOnTap(it, block.action) }
 
-        is PaywallBlock.Image -> imageSlot(block)
+        is PaywallBlock.Image -> imageSlot(block).also { closeOnTap(it, block.action) }
 
         is PaywallBlock.ListBlock -> listColumn(block)
 
@@ -331,23 +378,52 @@ internal class PaywallBlockRenderer(
         return column
     }
 
+    /**
+     * Makes an element the paywall's dismiss target when the design marks it
+     * as one (REV-252). A block with no close action gets no listener at all,
+     * so it never intercepts a tap meant for what sits behind it.
+     */
+    private fun closeOnTap(view: View, action: BlockAction?) {
+        val onClose = ctx.onClose
+        if (action != BlockAction.Close || onClose == null) return
+        view.isClickable = true
+        view.contentDescription = "Close"
+        // The whole box is the target, not just the glyph: a close chip is
+        // mostly padding, and a bare × is well under the 48dp tap minimum.
+        view.setOnClickListener { onClose() }
+    }
+
     private fun buttonView(block: PaywallBlock.Button, pkg: BlockPackage?): View {
         val accent = revnixBlockColor(doc.accent, doc) ?: Color.BLUE
         val ink = revnixBlockColor(doc.accentInk, doc) ?: Color.WHITE
+        // A button the design marks as the close dismisses instead of buying,
+        // and takes no accent fill: the CTA must stay the one accented thing
+        // on the screen, or a "Not now" competes with "Subscribe" for the eye.
+        val closes = block.action == BlockAction.Close && ctx.onClose != null
         val label = textView(revnixResolveTags(block.label, pkg, ctx.packages), block.style)
         label.gravity = Gravity.CENTER
-        label.setTextColor(revnixBlockColor(block.style?.textColor, doc) ?: ink)
+        label.setTextColor(
+            revnixBlockColor(block.style?.textColor, doc)
+                ?: if (closes) (revnixBlockColor(doc.textColor, doc) ?: Color.WHITE) else ink,
+        )
         label.typeface = Typeface.DEFAULT_BOLD
         val background = GradientDrawable()
-        background.setColor(revnixBlockColor(block.style?.fill, doc) ?: accent)
+        background.setColor(
+            revnixBlockColor(block.style?.fill, doc)
+                ?: if (closes) Color.TRANSPARENT else accent,
+        )
         background.cornerRadius = dp(block.style?.radius ?: 12.0).toFloat()
         label.background = background
         val vertical = if (block.style?.height != null) 0 else dp(15.0)
         label.setPadding(dp(16.0), vertical, dp(16.0), vertical)
         label.isClickable = true
         label.setOnClickListener {
-            val id = ctx.selectedPackageId ?: ctx.packages.firstOrNull()?.packageId
-            if (id != null) ctx.onPurchase(id)
+            if (closes) {
+                ctx.onClose?.invoke()
+            } else {
+                val id = ctx.selectedPackageId ?: ctx.packages.firstOrNull()?.packageId
+                if (id != null) ctx.onPurchase(id)
+            }
         }
         return label
     }

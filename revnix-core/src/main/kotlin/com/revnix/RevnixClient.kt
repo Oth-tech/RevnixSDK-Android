@@ -338,9 +338,24 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     /** Fire-and-forget impression beacon (feeds funnels + view conversions). */
     public suspend fun logPaywallShown(placementKey: String?, paywallId: String?) {
+        logPaywallDisplay(placementKey, paywallId)
+    }
+
+    /**
+     * The same beacon, returning the view id it generated (REV-252).
+     *
+     * Hand that id to [logPaywallClosed] when the customer dismisses THIS
+     * display: the two events sharing one view id is what lets the ledger pair
+     * a close with the display it ended, and the gap between their timestamps
+     * is the customer's dwell on the screen. The id comes back even when
+     * delivery fails — the caller's pairing must not depend on the network,
+     * and the close beacon carries its own idempotency key.
+     */
+    public suspend fun logPaywallDisplay(placementKey: String?, paywallId: String?): String {
+        val viewId = UUID.randomUUID().toString().lowercase()
         val body = buildJsonObject {
             put("customerId", JsonPrimitive(customerId()))
-            put("viewId", JsonPrimitive(UUID.randomUUID().toString().lowercase()))
+            put("viewId", JsonPrimitive(viewId))
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
             placementKey?.let { put("placementKey", JsonPrimitive(it)) }
             paywallId?.let { put("paywallId", JsonPrimitive(it)) }
@@ -350,6 +365,33 @@ public class RevnixClient(private val config: RevnixConfig) {
         } catch (err: RevnixError) {
             bgFailures += 1
             diagnostic("logPaywallShown", err.message.orEmpty())
+        }
+        return viewId
+    }
+
+    /**
+     * Fire-and-forget dismissal beacon (REV-252) — the other half of a
+     * display's life. Idempotent per view id, exactly like the view report.
+     *
+     * Pass the id [logPaywallDisplay] returned for this display.
+     */
+    public suspend fun logPaywallClosed(
+        viewId: String,
+        placementKey: String?,
+        paywallId: String?,
+    ) {
+        val body = buildJsonObject {
+            put("customerId", JsonPrimitive(customerId()))
+            put("viewId", JsonPrimitive(viewId))
+            put("sdkVersion", JsonPrimitive(SDK_VERSION))
+            placementKey?.let { put("placementKey", JsonPrimitive(it)) }
+            paywallId?.let { put("paywallId", JsonPrimitive(it)) }
+        }
+        try {
+            request("POST", listOf("v1", "paywalls", "closed"), body)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("logPaywallClosed", err.message.orEmpty())
         }
     }
 
