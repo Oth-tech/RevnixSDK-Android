@@ -392,7 +392,16 @@ public data class PaywallBlockDoc(
      * a whole; "flow" designs lay out in a scrolling column.
      */
     public val layout: String?,
+    /**
+     * The ground paint — a colour or a CSS gradient string. Kept flat because
+     * it is what `@bg` resolves against and what every unedited paywall has.
+     */
     public val background: String,
+    /**
+     * The background exactly as published, so the photo and scrim layers can
+     * be resolved. Null for a document whose background is a plain string.
+     */
+    public val backgroundSpec: JsonElement? = null,
     public val textColor: String,
     public val accent: String,
     public val accentInk: String,
@@ -415,14 +424,16 @@ public data class PaywallBlockDoc(
             if (rawBlocks.isEmpty()) return null
             val blocks = rawBlocks.map { parseBlock(it) }
             // `background` is a plain string in the original form and an object
-            // in the layered one; both reduce to the ground colour drawn here.
-            val background = o["background"]?.stringOrNull
-                ?: (o["background"] as? JsonObject)?.get("ground")?.stringOrNull
-                ?: "#000000"
+            // in the layered one. The object's ground field is `color` —
+            // `ground` is the name of the RESOLVED layer, and reading that off
+            // the wire is what used to paint every edited paywall black.
+            val backgroundSpec = o["background"]
+            val background = revnixBackgroundGround(backgroundSpec) ?: "#000000"
             return PaywallBlockDoc(
                 version = o["version"]?.intOrNullSafe ?: 1,
                 layout = o["layout"]?.stringOrNull,
                 background = background,
+                backgroundSpec = backgroundSpec,
                 textColor = o["textColor"]?.stringOrNull ?: "#FFFFFF",
                 accent = o["accent"]?.stringOrNull ?: "#6478ff",
                 accentInk = o["accentInk"]?.stringOrNull ?: "#FFFFFF",
@@ -637,6 +648,10 @@ public fun revnixBlockColor(value: String?, doc: PaywallBlockDoc): Int? {
         raw = when (name) {
             "accent" -> doc.accent
             "accentInk" -> doc.accentInk
+            // The raw ground, gradient and all — exactly what the dashboard
+            // answers `@bg` with. A gradient is not a colour, so the parser
+            // below returns null and the caller keeps its own default, which
+            // is what the builder shows for a `@bg` tint over a gradient.
             "bg" -> doc.background
             "text" -> doc.textColor
             else -> return null
