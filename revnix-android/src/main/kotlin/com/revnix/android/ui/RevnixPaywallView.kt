@@ -46,8 +46,11 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import com.revnix.BlockPackage
+import com.revnix.PaywallBlockDoc
 import com.revnix.PaywallConfig
 import com.revnix.RevnixClient
+import com.revnix.revnixBlockColor
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.roundToInt
@@ -63,6 +66,20 @@ public data class RevnixPaywallPackage(
     val packageId: String,
     val title: String,
     val priceLabel: String,
+    /**
+     * Renewal cycle from the product ("annual", "monthly", "weekly", …).
+     * Drives the `{period}` / `{period_short}` tags on a designed paywall;
+     * absent for lifetime and one-time products.
+     */
+    val period: String? = null,
+    /**
+     * The store's price in MINOR units, with its currency — what
+     * `{price_per_month}` and `{save_percent}` are computed from. Omit them
+     * and those tags stay visible rather than resolving to a wrong number; see
+     * [com.revnix.revnixMinorUnits] before converting from major units.
+     */
+    val amountMinor: Long? = null,
+    val currency: String? = null,
 )
 
 /**
@@ -310,6 +327,13 @@ public class RevnixPaywallView @JvmOverloads constructor(
         heroImageView = null
         removeAllViews()
         val config = this.config ?: return
+
+        // Precedence: a designed paywall (`config.blocks`) wins over the
+        // classic layouts below, which stay the fallback for every paywall
+        // published before the block builder — so anything already live
+        // renders unchanged.
+        val blockDoc = PaywallBlockDoc.parse(config.blocks)
+        if (blockDoc != null && renderBlocks(blockDoc, config)) return
 
         // Base scheme comes from the dashboard config (mode: dark|light,
         // absent = dark for legacy configs); the host's explicit override
@@ -1301,6 +1325,75 @@ public class RevnixPaywallView @JvmOverloads constructor(
         lp.bottomMargin = dp(bottom)
         if (gravity != Gravity.NO_GRAVITY) lp.gravity = gravity
         addView(view, lp)
+    }
+
+    /**
+     * Draws a designed paywall, reporting whether it succeeded.
+     *
+     * Wrapped so a malformed document costs the paywall its DESIGN, not the
+     * purchase: if the tree fails to draw, `render()` carries on into the
+     * classic layout, which is a working screen the customer can still buy
+     * from. A shipped app cannot be patched from our side, so the fallback
+     * matters more than the failure being loud.
+     */
+    private fun renderBlocks(blockDoc: PaywallBlockDoc, config: PaywallConfig): Boolean {
+        val shown = packages
+        shownPackages = shown
+        val selected = selectedPackageIdOrDefault(config, shown)
+        val blockPackages = shown.map {
+            BlockPackage(
+                packageId = it.packageId,
+                title = it.title,
+                priceLabel = it.priceLabel,
+                period = it.period,
+                amountMinor = it.amountMinor,
+                currency = it.currency,
+            )
+        }
+        val screen = runCatching {
+            PaywallBlockRenderer(
+                context,
+                BlockContext(
+                    doc = blockDoc,
+                    packages = blockPackages,
+                    selectedPackageId = selected,
+                    heroImageUrl = config.heroImageUrl,
+                    footerTermsUrl = config.footer?.termsUrl,
+                    footerPrivacyUrl = config.footer?.privacyUrl,
+                    onPurchase = { id -> if (!loading) onPurchase?.invoke(id) },
+                    onRestore = onRestore,
+                    onTerms = onTerms,
+                    onPrivacy = onPrivacy,
+                ),
+            ).renderScreen()
+        }.getOrNull() ?: return false
+
+        revnixBlockColor(blockDoc.background, blockDoc)?.let { setBackgroundColor(it) }
+        addView(
+            screen,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),
+        )
+        // The paywall.viewed report is raised by bind(), which both render
+        // paths go through — a designed paywall reports exactly like a
+        // classic one, and neither path can double-count.
+        return true
+    }
+
+    /**
+     * The package the design emphasizes: the host's controlled selection, then
+     * the internal one, then the config's highlight, then the first package.
+     */
+    private fun selectedPackageIdOrDefault(
+        config: PaywallConfig,
+        shown: List<RevnixPaywallPackage>,
+    ): String? {
+        val controlled = selectedPackageId
+        if (controlled != null && shown.any { it.packageId == controlled }) return controlled
+        val internal = internalSelected
+        if (internal != null && shown.any { it.packageId == internal }) return internal
+        val highlight = config.highlightPackageId
+        if (highlight != null && shown.any { it.packageId == highlight }) return highlight
+        return shown.firstOrNull()?.packageId
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()

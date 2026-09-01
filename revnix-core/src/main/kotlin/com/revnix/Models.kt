@@ -151,6 +151,18 @@ public data class PaywallConfig(
     val offer: Offer? = null,
     /** Footer links, dashboard-configured. Absent (legacy) = show all three. */
     val footer: Footer? = null,
+    /**
+     * A designed paywall: the block tree the dashboard's builder authored.
+     * When present `RevnixPaywallView` renders THIS and the fields above act
+     * as the fallback for apps on an SDK that predates block rendering — so an
+     * older app keeps showing a sane classic screen instead of nothing.
+     *
+     * Held as raw JSON rather than a typed tree for two reasons: the core
+     * stays free of renderer types, and a document from a NEWER dashboard can
+     * never fail to decode here — `PaywallBlockDoc.parse` turns it into the
+     * parts this SDK understands. See [PaywallBlockDoc].
+     */
+    val blocks: JsonElement? = null,
 ) {
     @Serializable
     public data class Feature(
