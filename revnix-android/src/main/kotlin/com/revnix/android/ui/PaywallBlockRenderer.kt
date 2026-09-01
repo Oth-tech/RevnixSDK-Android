@@ -45,7 +45,11 @@ import com.revnix.BlockPackage
 import com.revnix.BlockStyle
 import com.revnix.PaywallBlock
 import com.revnix.PaywallBlockDoc
+import com.revnix.RevnixBackgroundLayers
+import com.revnix.revnixBackgroundBaseColor
+import com.revnix.revnixBackgroundLayers
 import com.revnix.revnixBlockColor
+import com.revnix.revnixParseCssGradients
 import com.revnix.revnixResolveTags
 import kotlin.math.roundToInt
 
@@ -83,6 +87,34 @@ internal class PaywallBlockRenderer(
     private fun dp(value: Double): Int = (value * density).roundToInt()
 
     /**
+     * The gradient, photo and scrim layers, bottom first. Empty for an
+     * unedited paywall whose background is a flat colour, so that case renders
+     * exactly as it did before.
+     */
+    private fun backgroundArt(layers: RevnixBackgroundLayers): List<View> {
+        val out = mutableListOf<View>()
+
+        layers.ground?.let { ground ->
+            val gradients = revnixParseCssGradients(ground) { revnixBlockColor(it, doc) }
+            if (gradients.isNotEmpty()) {
+                out.add(View(context).apply { background = RevnixGradientDrawable(gradients) })
+            }
+        }
+
+        layers.image?.let { out.add(RevnixBackgroundPhotoView(context, it)) }
+
+        layers.overlay?.let { overlay ->
+            val gradients = revnixParseCssGradients(overlay.fill) { revnixBlockColor(it, doc) }
+            val solid = if (gradients.isEmpty()) revnixBlockColor(overlay.fill, doc) else null
+            if (gradients.isNotEmpty() || solid != null) {
+                out.add(revnixScrimView(context, solid, gradients, overlay.opacity))
+            }
+        }
+
+        return out
+    }
+
+    /**
      * The whole screen.
      *
      * A `canvas` document is authored against a fixed 393×852 device screen; it
@@ -92,7 +124,13 @@ internal class PaywallBlockRenderer(
      */
     fun renderScreen(): View {
         val screen = FrameLayout(context)
-        revnixBlockColor(doc.background, doc)?.let { screen.setBackgroundColor(it) }
+        val layers = revnixBackgroundLayers(doc.backgroundSpec)
+        // The flat colour under everything. A gradient ground resolves to its
+        // first stop here, so a form the parser does not understand still
+        // shows a colour from the design rather than black.
+        revnixBlockColor(revnixBackgroundBaseColor(layers.ground ?: doc.background), doc)
+            ?.let { screen.setBackgroundColor(it) }
+        for (layer in backgroundArt(layers)) screen.addView(layer, revnixFillParams())
 
         val body = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL

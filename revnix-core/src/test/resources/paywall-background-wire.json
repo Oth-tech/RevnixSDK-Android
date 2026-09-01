@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "layout": "flow",
+  "background": {
+    "color": "radial-gradient(120% 85% at 50% 0%, #D6FF3F38 0%, #D6FF3F00 58%), linear-gradient(180deg, #111820 0%, #07090C 100%)",
+    "presetId": "neon-track-spotlight"
+  },
+  "textColor": "#FFFFFF",
+  "accent": "#D6FF3F",
+  "accentInk": "#14160A",
+  "blocks": [{ "id": "t1", "type": "text", "text": "Go Pro" }]
+}
