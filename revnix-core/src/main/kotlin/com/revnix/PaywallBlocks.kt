@@ -264,6 +264,24 @@ public data class BlockStyle(
     }
 }
 
+/**
+ * What tapping a block does. Absent means the block is decoration.
+ *
+ * A FIELD on the existing block types rather than a new block type: an SDK
+ * older than this one drops the field and still draws the element exactly as
+ * it does today, so a design carrying a close chip degrades to inert. A new
+ * block type would have parsed to [PaywallBlock.Unknown] and vanished from the
+ * screen instead — worse than the bug this fixes.
+ */
+public enum class BlockAction {
+    Close;
+
+    internal companion object {
+        /** An action this SDK does not know leaves the element inert. */
+        fun from(value: String?): BlockAction? = if (value == "close") Close else null
+    }
+}
+
 /** One entry of a [PaywallBlock.ListBlock]. */
 public data class BlockListItem(
     public val icon: String? = null,
@@ -287,6 +305,8 @@ public sealed class PaywallBlock {
         override val id: String,
         public val text: String,
         override val style: BlockStyle? = null,
+        /** Tapping this block dismisses the paywall. See [BlockAction]. */
+        public val action: BlockAction? = null,
     ) : PaywallBlock()
 
     public data class Image(
@@ -297,6 +317,8 @@ public sealed class PaywallBlock {
         public val fit: String? = null,
         public val placeholder: String? = null,
         override val style: BlockStyle? = null,
+        /** Tapping this block dismisses the paywall. See [BlockAction]. */
+        public val action: BlockAction? = null,
     ) : PaywallBlock()
 
     public data class ListBlock(
@@ -324,6 +346,11 @@ public sealed class PaywallBlock {
         override val id: String,
         public val label: String,
         override val style: BlockStyle? = null,
+        /**
+         * [BlockAction.Close] turns this button into a dismiss ("Not now")
+         * instead of the purchase CTA, which is what a button means by default.
+         */
+        public val action: BlockAction? = null,
     ) : PaywallBlock()
 
     public data class Links(
@@ -448,10 +475,11 @@ public data class PaywallBlockDoc(
             val style = BlockStyle.from(o["style"])
             fun s(key: String) = o[key]?.stringOrNull
             fun b(key: String) = o[key]?.booleanOrNullSafe
+            val action = BlockAction.from(s("action"))
             return when (o["type"]?.stringOrNull) {
-                "text" -> PaywallBlock.Text(id, s("text") ?: "", style)
+                "text" -> PaywallBlock.Text(id, s("text") ?: "", style, action)
                 "image" -> PaywallBlock.Image(
-                    id, s("url"), s("shape"), s("fit"), s("placeholder"), style,
+                    id, s("url"), s("shape"), s("fit"), s("placeholder"), style, action,
                 )
                 "list" -> PaywallBlock.ListBlock(
                     id,
@@ -470,7 +498,7 @@ public data class PaywallBlockDoc(
                     s("badgeText"), BlockStyle.from(o["cardStyle"]),
                     BlockStyle.from(o["highlightStyle"]), style,
                 )
-                "button" -> PaywallBlock.Button(id, s("label") ?: "", style)
+                "button" -> PaywallBlock.Button(id, s("label") ?: "", style, action)
                 "links" -> PaywallBlock.Links(
                     id, b("showRestore"), b("showTerms"), b("showPrivacy"),
                     s("termsUrl"), s("privacyUrl"), style,
@@ -726,3 +754,29 @@ private fun JsonElement.asObjectOrNull(): JsonObject? = runCatching { jsonObject
 
 @Suppress("unused")
 private fun JsonElement.asArrayOrNull(): JsonArray? = runCatching { jsonArray }.getOrNull()
+
+/**
+ * Does this tree author a dismiss affordance that is CERTAIN to render?
+ *
+ * The renderer draws its own close button only when this is false, so a design
+ * published before close existed becomes dismissible without being
+ * re-authored, and a design that DOES author a close chip never shows two. The
+ * same predicate exists in every Revnix SDK — keep them identical.
+ */
+public fun revnixHasCloseAction(blocks: List<PaywallBlock>): Boolean = blocks.any { block ->
+    when (block) {
+        is PaywallBlock.Text -> block.action == BlockAction.Close
+        is PaywallBlock.Image -> block.action == BlockAction.Close
+        is PaywallBlock.Button -> block.action == BlockAction.Close
+        // Conditional containers are deliberately not searched: a `repeat`
+        // card renders once per package (none, when the offering is empty) and
+        // a `packageIndex` card is hidden when the offering does not reach that
+        // index, so a close authored inside one MIGHT not appear. Counting it
+        // would suppress the fallback and leave the customer with no way out —
+        // the exact bug this feature exists to fix.
+        is PaywallBlock.Card ->
+            block.repeat == null && block.packageIndex == null &&
+                revnixHasCloseAction(block.children)
+        else -> false
+    }
+}

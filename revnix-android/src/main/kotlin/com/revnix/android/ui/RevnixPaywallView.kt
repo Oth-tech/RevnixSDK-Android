@@ -55,9 +55,11 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -188,7 +190,21 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private var onRestore: (() -> Unit)? = null
     private var onTerms: (() -> Unit)? = null
     private var onPrivacy: (() -> Unit)? = null
+    private var onClose: (() -> Unit)? = null
     private var themeOverride: RevnixPaywallThemeOverride? = null
+
+    // ——— REV-252: this display's close reporting ———
+    /** The client bind() was given, kept so a dismissal can report itself. */
+    private var reportingClient: RevnixClient? = null
+    /** The in-flight view beacon (REV-252). The close AWAITS this rather than
+     *  reading an id off a field, which fixes two things at once: the id only
+     *  exists once the request returns, so a fast dismissal would otherwise
+     *  lose the pairing; and a PREVIOUS bind's beacon can no longer land after
+     *  a rebind and stamp a stale id over the new display's. Each bind owns
+     *  its own Deferred, so a close can only ever read its own display's. */
+    private var viewReport: Deferred<String?>? = null
+    private var reportPlacementKey: String? = null
+    private var reportPaywallId: String? = null
 
     /** The packages the active template actually shows ("minimal" filters). */
     private var shownPackages: List<RevnixPaywallPackage> = emptyList()
@@ -261,6 +277,12 @@ public class RevnixPaywallView @JvmOverloads constructor(
      *   pressed.
      * @param selectedPackageId Seeds [selectedPackageId] (controlled mode);
      *   null for internal selection.
+     * @param onClose Dismissal (REV-252). The HOST performs it — only the app
+     *   knows whether that means finishing an activity, popping a fragment, or
+     *   advancing onboarding — so the view never dismisses itself. Omit it and
+     *   no close is drawn at all: a dead close button is worse than none.
+     *   Passing [client] as well reports `paywall.closed` against this
+     *   display's own view id.
      * @param disableViewTracking Opt out of the automatic view report while
      *   still passing [client].
      */
@@ -273,6 +295,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         onRestore: (() -> Unit)? = null,
         onTerms: (() -> Unit)? = null,
         onPrivacy: (() -> Unit)? = null,
+        onClose: (() -> Unit)? = null,
         theme: RevnixPaywallThemeOverride? = null,
         client: RevnixClient? = null,
         placementKey: String? = null,
@@ -286,14 +309,45 @@ public class RevnixPaywallView @JvmOverloads constructor(
         this.onRestore = onRestore
         this.onTerms = onTerms
         this.onPrivacy = onPrivacy
+        this.onClose = onClose
         this.themeOverride = theme
         this.internalSelected = null
         this.selectedPackageId = selectedPackageId
+        // A rebind is a new display, so the previous one's beacon must not
+        // leak into it and mis-pair the next close (REV-252). Cancelling is
+        // belt-and-braces — the field is replaced below either way.
+        this.viewReport?.cancel()
+        this.viewReport = null
+        this.reportingClient = if (disableViewTracking) null else client
+        this.reportPlacementKey = placementKey
+        this.reportPaywallId = paywallId
         render()
         if (client != null && !disableViewTracking) {
             // Fire-and-forget; the client swallows failures into diagnostics
             // and dispatches to IO internally.
-            viewScope.launch { client.logPaywallShown(placementKey, paywallId) }
+            viewReport = viewScope.async { client.logPaywallDisplay(placementKey, paywallId) }
+        }
+    }
+
+    /**
+     * Runs the host's dismissal, reporting `paywall.closed` alongside it
+     * (REV-252). The host's callback runs FIRST and unconditionally: the
+     * beacon is best-effort, and an analytics failure must never be able to
+     * trap the customer on the screen.
+     */
+    private fun closeAndReport() {
+        onClose?.invoke()
+        val client = reportingClient ?: return
+        val report = viewReport ?: return
+        val placementKey = reportPlacementKey
+        val paywallId = reportPaywallId
+        viewScope.launch {
+            // Awaiting the view beacon is what keeps the pair intact when the
+            // customer dismisses before it lands. It has usually finished long
+            // ago, in which case this resumes immediately. A cancelled beacon
+            // (the view was rebound or detached) reports nothing.
+            val id = runCatching { report.await() }.getOrNull() ?: return@launch
+            client.logPaywallClosed(id, placementKey, paywallId)
         }
     }
 
@@ -453,8 +507,47 @@ public class RevnixPaywallView @JvmOverloads constructor(
         scroll.clipToPadding = false
         scroll.addView(scrollContent, LayoutParams(MATCH, WRAP))
         addView(scroll, LayoutParams(MATCH, MATCH))
+        addClassicClose(theme)
 
         applySelection()
+    }
+
+    /**
+     * The dismiss affordance the classic layouts get (REV-252).
+     *
+     * The nine `template` layouts have the same problem the designed ones had
+     * — nothing on the screen closes them — and `onClose` is a parameter of
+     * the shared bind(), so a host that wires it must get a close on either
+     * path rather than silently nothing. Classic layouts author no elements of
+     * their own, so there is never a design chip to suppress: the rule reduces
+     * to "draw it whenever the host wired a handler".
+     *
+     * The designed path draws its own (inside the block renderer, where it can
+     * see the tree), so this is never called there.
+     */
+    private fun addClassicClose(theme: RevnixPaywallTheme) {
+        if (onClose == null) return
+        val ink = theme.textPrimary
+        val glyph = TextView(context).apply {
+            text = "\u00d7"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextColor(ink)
+            gravity = Gravity.CENTER
+            contentDescription = "Close"
+            isClickable = true
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(withAlpha(ink, 0x24)) // 14%, the same wash the block renderer uses
+            }
+            setOnClickListener { closeAndReport() }
+        }
+        addView(
+            glyph,
+            LayoutParams(dp(30), dp(30), Gravity.TOP or Gravity.END).apply {
+                topMargin = dp(14)
+                marginEnd = dp(14)
+            },
+        )
     }
 
     // ——— shared blocks (each layout composes a subset; keep every block in
@@ -1376,6 +1469,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     onRestore = onRestore,
                     onTerms = onTerms,
                     onPrivacy = onPrivacy,
+                    onClose = onClose?.let { { closeAndReport() } },
                 ),
             ).renderScreen()
         }.getOrNull() ?: return false
