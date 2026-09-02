@@ -16,6 +16,9 @@ import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -387,6 +390,66 @@ class RevnixClientTest {
         assertNull(config.review)
         assertNull(config.offer)
         assertNull(config.footer)
+    }
+
+    // MARK: - Raw wire passthrough (bridges that render the paywall themselves)
+
+    private val placementDesignedBody = """
+        {"status":"ok","placementKey":"main","revision":5,"offering":{"offeringId":"off_3","displayName":"Designed","packages":[{"packageId":"pkg_3","productId":"pro.yearly"}]},"paywall":{"paywallId":"pw_1","name":"Main","config":{"template":"focus","headline":"Unlock","ctaLabel":"Go","blocks":{"version":1,"layout":"flow","blocks":[{"type":"hologram","spin":3}]},"futureField":"kept"}},"experiment":{"key":"summer-pricing","variantId":"var_b"}}
+    """.trimIndent()
+
+    /**
+     * `paywallJson` / `experimentJson` are the wire values untouched: a block
+     * type and a config field this SDK does not know survive there, while the
+     * typed `paywall` still decodes beside them — and the cache stores the raw
+     * copy, so offline hands a bridge the same document.
+     */
+    @Test
+    fun `raw paywall and experiment survive beside the typed views`() = runBlocking {
+        route("/placements" to onceThen(json(200, placementDesignedBody)) { disconnect() })
+        val client = makeClient()
+        val live = client.resolvePlacement("main")
+        assertEquals("pw_1", live.paywall?.paywallId)
+        val config = live.paywallJson!!.jsonObject["config"]!!.jsonObject
+        assertEquals("kept", config["futureField"]!!.jsonPrimitive.content)
+        val firstBlock = config["blocks"]!!.jsonObject["blocks"]!!.jsonArray.first().jsonObject
+        assertEquals("hologram", firstBlock["type"]!!.jsonPrimitive.content)
+        assertEquals("var_b", live.experimentJson!!.jsonObject["variantId"]!!.jsonPrimitive.content)
+
+        // Offline now → the cached resolution carries the same raw document.
+        val cached = client.resolvePlacement("main")
+        assertEquals(live.paywallJson, cached.paywallJson)
+        assertEquals(live.experimentJson, cached.experimentJson)
+        assertEquals(live.paywall, cached.paywall)
+    }
+
+    /**
+     * A paywall the typed model cannot read (no `headline` / `ctaLabel`, an
+     * experiment missing `variantId`) must not fail the resolution — the
+     * offering and the raw copies still arrive, the typed views are null.
+     */
+    @Test
+    fun `an untypeable paywall still delivers the offering and the raw copies`() = runBlocking {
+        route("/placements" to { json(200, """{"status":"ok","placementKey":"main","revision":6,"offering":{"offeringId":"off_4","displayName":"Blocks only","packages":[{"packageId":"pkg_4","productId":"pro.weekly"}]},"paywall":{"paywallId":"pw_2","name":"Next","config":{"template":"canvas","blocks":{"version":2,"layout":"grid","blocks":[]}}},"experiment":{"key":"k"}}""") })
+        val client = makeClient()
+        val resolution = client.resolvePlacement("main")
+        assertEquals("off_4", resolution.offering.offeringId)
+        assertNull(resolution.paywall)
+        assertNull(resolution.experiment)
+        assertEquals("pw_2", resolution.paywallJson!!.jsonObject["paywallId"]!!.jsonPrimitive.content)
+        assertEquals("k", resolution.experimentJson!!.jsonObject["key"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `raw copies are null when the wire has none`() = runBlocking {
+        route("/placements" to onceThen(json(200, placementNullExperimentBody)) { json(200, placementBody) })
+        val client = makeClient()
+        val nullCase = client.resolvePlacement("main")
+        assertNull(nullCase.paywallJson)
+        assertNull(nullCase.experimentJson)
+        val absentCase = client.resolvePlacement("main")
+        assertNull(absentCase.paywallJson)
+        assertNull(absentCase.experimentJson)
     }
 
     // MARK: - Experiments (REV-219)

@@ -1,8 +1,15 @@
 package com.revnix
 
 import kotlinx.serialization.SerialName
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonEncoder
+import kotlinx.serialization.json.JsonNull
 
 /** Response models are 1:1 with `revnix-app/public/openapi.yaml` schemas. */
 
@@ -218,7 +225,7 @@ public data class PlacementExperiment(
     val variantId: String,
 )
 
-@Serializable
+@Serializable(with = PlacementResolutionSerializer::class)
 public data class PlacementResolution(
     val status: String,
     val placementKey: String,
@@ -232,7 +239,81 @@ public data class PlacementResolution(
      * older servers) when no running experiment covers the placement.
      */
     val experiment: PlacementExperiment? = null,
+    /**
+     * The `paywall` value exactly as the server sent it, alongside the typed
+     * view above. A host that renders the document itself (the Flutter and
+     * Capacitor bridges hand it to Dart / JS) forwards THIS, so a document
+     * from a newer dashboard arrives untouched. Null when the server sent
+     * null or omitted the key.
+     */
+    val paywallJson: JsonElement? = null,
+    /** `experiment` as the server sent it; same purpose as [paywallJson]. */
+    val experimentJson: JsonElement? = null,
 )
+
+/**
+ * Reads `paywall` / `experiment` twice from one wire object: loose into
+ * [PlacementResolution.paywallJson] / [PlacementResolution.experimentJson],
+ * typed into the fields the native renderer uses. The typed halves are
+ * tolerant for the same reason `PaywallConfig.blocks` is raw: a document from
+ * a newer dashboard must never be able to fail the whole resolution — the
+ * offering and the raw copy still arrive, the typed view is simply null.
+ *
+ * On the way out the raw value wins when present, so any re-encode (the
+ * client caches the wire string itself and never takes this path) stays
+ * lossless. JSON only: nothing else ever carries these models.
+ */
+internal object PlacementResolutionSerializer : KSerializer<PlacementResolution> {
+    @Serializable
+    private class Wire(
+        val status: String,
+        val placementKey: String,
+        val revision: Long,
+        val offering: PlacementOffering,
+        val paywall: JsonElement? = null,
+        val experiment: JsonElement? = null,
+    )
+
+    override val descriptor: SerialDescriptor = Wire.serializer().descriptor
+
+    override fun deserialize(decoder: Decoder): PlacementResolution {
+        // The caller's Json (the client's, ignoreUnknownKeys) decodes the typed
+        // halves, so a new field on a paywall config stays as tolerated as before.
+        val json = (decoder as JsonDecoder).json
+        val wire = decoder.decodeSerializableValue(Wire.serializer())
+        val paywallJson = wire.paywall?.takeUnless { it is JsonNull }
+        val experimentJson = wire.experiment?.takeUnless { it is JsonNull }
+        return PlacementResolution(
+            status = wire.status,
+            placementKey = wire.placementKey,
+            revision = wire.revision,
+            offering = wire.offering,
+            paywall = paywallJson?.let {
+                runCatching { json.decodeFromJsonElement(PlacementPaywall.serializer(), it) }.getOrNull()
+            },
+            experiment = experimentJson?.let {
+                runCatching { json.decodeFromJsonElement(PlacementExperiment.serializer(), it) }.getOrNull()
+            },
+            paywallJson = paywallJson,
+            experimentJson = experimentJson,
+        )
+    }
+
+    override fun serialize(encoder: Encoder, value: PlacementResolution) {
+        val json = (encoder as JsonEncoder).json
+        val wire = Wire(
+            status = value.status,
+            placementKey = value.placementKey,
+            revision = value.revision,
+            offering = value.offering,
+            paywall = value.paywallJson
+                ?: value.paywall?.let { json.encodeToJsonElement(PlacementPaywall.serializer(), it) },
+            experiment = value.experimentJson
+                ?: value.experiment?.let { json.encodeToJsonElement(PlacementExperiment.serializer(), it) },
+        )
+        encoder.encodeSerializableValue(Wire.serializer(), wire)
+    }
+}
 
 /** Swallowed background failure (queue drains, telemetry beacons). */
 public data class RevnixDiagnostic(val op: String, val message: String)
