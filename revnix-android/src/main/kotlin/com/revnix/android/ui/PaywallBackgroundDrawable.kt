@@ -17,6 +17,7 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RadialGradient
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.RenderEffect
 import android.graphics.Shader
 import android.graphics.drawable.Drawable
@@ -40,9 +41,12 @@ import kotlin.math.max
  */
 internal class RevnixGradientDrawable(
     private val gradients: List<RevnixGradient>,
+    /** Corner radius in px. A block fill has to clip to the box it fills. */
+    private val cornerRadius: Float = 0f,
 ) : Drawable() {
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val rect = RectF()
     private var shaders: List<Shader> = emptyList()
     private var built = Rect()
 
@@ -89,11 +93,25 @@ internal class RevnixGradientDrawable(
 
     override fun draw(canvas: Canvas) {
         build(bounds)
+        rect.set(bounds)
+        // Nothing is painted UNDER the layers: a gradient that fades through a
+        // translucent stop is drawn over the screen's art precisely so it shows
+        // through, and a flat base would make it a solid block.
         for (shader in shaders) {
             paint.shader = shader
-            canvas.drawRect(bounds, paint)
+            fill(canvas, paint)
         }
         paint.shader = null
+    }
+
+    /** A rounded box when the design asked for one, a plain rect otherwise —
+     *  `drawRoundRect` with a zero radius still costs a path. */
+    private fun fill(canvas: Canvas, paint: Paint) {
+        if (cornerRadius > 0f) {
+            canvas.drawRoundRect(rect, cornerRadius, cornerRadius, paint)
+        } else {
+            canvas.drawRect(rect, paint)
+        }
     }
 
     override fun setAlpha(alpha: Int) {

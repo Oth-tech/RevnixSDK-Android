@@ -50,6 +50,7 @@ import com.revnix.BlockPackage
 import com.revnix.PaywallBlockDoc
 import com.revnix.PaywallConfig
 import com.revnix.RevnixClient
+import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBlockColor
 import java.net.HttpURLConnection
 import java.net.URL
@@ -196,6 +197,10 @@ public class RevnixPaywallView @JvmOverloads constructor(
     // ——— REV-252: this display's close reporting ———
     /** The client bind() was given, kept so a dismissal can report itself. */
     private var reportingClient: RevnixClient? = null
+    /** The same client, kept even when view tracking is off: a render
+     *  diagnostic is not a beacon, and opting out of analytics should not
+     *  also silence "this paywall is drawing approximately". */
+    private var diagnosticClient: RevnixClient? = null
     /** The in-flight view beacon (REV-252). The close AWAITS this rather than
      *  reading an id off a field, which fixes two things at once: the id only
      *  exists once the request returns, so a fast dismissal would otherwise
@@ -319,6 +324,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         this.viewReport?.cancel()
         this.viewReport = null
         this.reportingClient = if (disableViewTracking) null else client
+        this.diagnosticClient = client
         this.reportPlacementKey = placementKey
         this.reportPaywallId = paywallId
         render()
@@ -1470,11 +1476,16 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     onTerms = onTerms,
                     onPrivacy = onPrivacy,
                     onClose = onClose?.let { { closeAndReport() } },
+                    onDiagnostic = diagnosticClient?.let { c -> { m: String -> c.reportRenderDiagnostic(m) } },
                 ),
             ).renderScreen()
         }.getOrNull() ?: return false
 
-        revnixBlockColor(blockDoc.background, blockDoc)?.let { setBackgroundColor(it) }
+        // The flat colour behind the rendered screen. A gradient ground has no
+        // single colour, so it collapses to its base here rather than leaving
+        // the view's own backdrop showing through.
+        revnixBlockColor(revnixBackgroundBaseColor(blockDoc.background), blockDoc)
+            ?.let { setBackgroundColor(it) }
         addView(
             screen,
             LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),

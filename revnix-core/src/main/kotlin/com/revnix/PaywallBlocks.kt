@@ -676,11 +676,13 @@ public fun revnixBlockColor(value: String?, doc: PaywallBlockDoc): Int? {
         raw = when (name) {
             "accent" -> doc.accent
             "accentInk" -> doc.accentInk
-            // The raw ground, gradient and all — exactly what the dashboard
-            // answers `@bg` with. A gradient is not a colour, so the parser
-            // below returns null and the caller keeps its own default, which
-            // is what the builder shows for a `@bg` tint over a gradient.
-            "bg" -> doc.background
+            // The ground's FLAT base colour, which is what the dashboard
+            // answers `@bg` with: it feeds the token into `color-mix()`, which
+            // cannot take a gradient, so it collapses a gradient ground to one
+            // colour first. Handing the raw gradient here instead made every
+            // `@bg` stop inside a gradient drop out — and a gradient left with
+            // one stop does not parse at all, so the whole fill was lost.
+            "bg" -> revnixBackgroundBaseColor(doc.background)
             "text" -> doc.textColor
             else -> return null
         }
@@ -691,9 +693,97 @@ public fun revnixBlockColor(value: String?, doc: PaywallBlockDoc): Int? {
     return (a.roundToInt().coerceIn(0, 255) shl 24) or (base and 0x00FFFFFF)
 }
 
-/** Parses "#rgb", "#rrggbb", "#rrggbbaa", "rgb()" and "rgba()" into ARGB. */
+/**
+ * A resolved paint: EITHER a flat colour, OR gradient layers, BOTTOM FIRST.
+ *
+ * The dashboard hands `fill` straight to CSS `background`, which takes a colour
+ * *or* a gradient *or* a stack of them. Android has no single type for that
+ * union, so it is carried as two fields and composed by the renderer.
+ *
+ * The two are never both set. The flat colour a gradient collapses to belongs
+ * only to the case where the gradient cannot be drawn: painting it underneath
+ * one that CAN be drawn makes the box opaque, and 83 of the library's 139
+ * gradient fills are scrims that fade through a translucent stop — they are
+ * drawn over the screen's photo precisely so it shows through.
+ */
+public data class RevnixBlockFill(
+    public val color: Int? = null,
+    public val gradients: List<RevnixGradient> = emptyList(),
+) {
+    public val isNone: Boolean get() = color == null && gradients.isEmpty()
+}
+
+/**
+ * Resolves a paint string the way the dashboard's CSS `background` does.
+ *
+ * A plain colour is tried first (the common case, and the cheap one), then the
+ * gradient forms, and only then the fallback. Nothing fails silently: a `fill`
+ * the design set but this build cannot read collapses to the first colour
+ * literal in the string — a colour FROM THE DESIGN, never black — and reports
+ * through [onDiagnostic].
+ */
+public fun revnixBlockFill(
+    value: String?,
+    doc: PaywallBlockDoc,
+    onDiagnostic: ((String) -> Unit)? = null,
+): RevnixBlockFill {
+    val raw = value?.trim().orEmpty()
+    if (raw.isEmpty()) return RevnixBlockFill()
+
+    revnixBlockColor(raw, doc)?.let { return RevnixBlockFill(color = it) }
+
+    val gradients = revnixParseCssGradients(raw) { revnixBlockColor(it, doc) }
+    if (gradients.isNotEmpty()) return RevnixBlockFill(gradients = gradients)
+
+    onDiagnostic?.invoke("unreadable fill $raw")
+    // A pattern paints nothing rather than a stripe colour spread over the box.
+    if (revnixIsRepeatingPattern(raw)) return RevnixBlockFill()
+    return RevnixBlockFill(color = revnixBlockColor(revnixBackgroundBaseColor(raw), doc))
+}
+
+/**
+ * The flat colour a parsed gradient stack stands in for: the first stop of the
+ * BOTTOM layer that is not fully transparent. It is what shows through a
+ * translucent stop, and what stays on screen if a layer fails to paint.
+ */
+public fun revnixGradientBaseColor(gradients: List<RevnixGradient>): Int? {
+    val bottom = gradients.firstOrNull() ?: return null
+    val stops = bottom.stops
+    return stops.firstOrNull { (it.color ushr 24) and 0xFF != 0 }?.color
+        ?: stops.firstOrNull()?.color
+}
+
+/**
+ * A field that can only ever be ONE colour — a border, text, an icon.
+ *
+ * A gradient there has no native form (nor a CSS one: `border-color` takes no
+ * gradient, so the dashboard drops the declaration outright). Collapsing it to
+ * the colour it stands for keeps the stroke or the glyph visible, which is
+ * nearer the design's intent than losing it.
+ */
+public fun revnixBlockStrokeColor(
+    value: String?,
+    doc: PaywallBlockDoc,
+    onDiagnostic: ((String) -> Unit)? = null,
+): Int? {
+    val raw = value?.trim().orEmpty()
+    if (raw.isEmpty()) return null
+    revnixBlockColor(raw, doc)?.let { return it }
+    val base = revnixGradientBaseColor(revnixParseCssGradients(raw) { revnixBlockColor(it, doc) })
+    if (base != null) {
+        onDiagnostic?.invoke("gradient flattened in a colour-only field: $raw")
+        return base
+    }
+    onDiagnostic?.invoke("unreadable colour $raw")
+    return revnixBlockColor(revnixBackgroundBaseColor(raw), doc)
+}
+
+/** Parses "#rgb", "#rrggbb", "#rrggbbaa", "rgb()", "rgba()" and `transparent` into ARGB. */
 internal fun parseColor(value: String): Int? {
     val s = value.trim()
+    // `transparent` appears in the shipped designs' gradient stops. Rejecting
+    // it dropped the stop, and a gradient left with one stop does not parse.
+    if (s.equals("transparent", ignoreCase = true)) return 0
     if (s.startsWith("#")) {
         var hex = s.substring(1)
         if (hex.length == 3 || hex.length == 4) hex = hex.map { "$it$it" }.joinToString("")
