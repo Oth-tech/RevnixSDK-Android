@@ -211,6 +211,27 @@ public sealed class RevnixGradient {
  * Splits on top-level commas only, so the commas inside `rgba(...)` and inside
  * a nested gradient's argument list do not tear an argument in half.
  */
+/**
+ * Whether a paint string's BOTTOM layer is a repeating pattern.
+ *
+ * A `repeating-*` gradient is a TEXTURE, and the colours inside it are stripe
+ * colours rather than the surface's. When a build cannot draw one, painting a
+ * colour lifted out of its arguments across the whole box is a WRONG answer
+ * rather than a degraded one — the library's `repeating-linear-gradient(180deg,
+ * #0E1B21 0 1px, @bg 1px 26px)` is a hairline every 26px, and its first colour
+ * as a solid fill is a slab. Such a fill paints nothing instead.
+ *
+ * The bottom layer is the one that decides, so a pattern stacked over a real
+ * ground (`repeating-…(…), #FBF3E4`) still falls back to that ground.
+ */
+public fun revnixIsRepeatingPattern(css: String?): Boolean {
+    val s = css?.trim().orEmpty()
+    if (s.isEmpty()) return false
+    val layers = revnixSplitTopLevel(s)
+    val bottom = layers.lastOrNull() ?: s
+    return bottom.startsWith("repeating-", ignoreCase = true)
+}
+
 internal fun revnixSplitTopLevel(input: String): List<String> {
     val out = mutableListOf<String>()
     var depth = 0
@@ -245,18 +266,39 @@ public fun revnixParseCssGradients(
 
 private class RawStop(val color: Int, val position: Double?)
 
-private fun parseStop(raw: String, parse: (String) -> Int?): RawStop? {
-    val s = raw.trim()
-    if (s.isEmpty()) return null
-    // The position is the trailing `<n>%`; everything before it is the colour,
-    // which may itself contain spaces (`rgba(0, 0, 0, 0.5)`).
-    val match = Regex("\\s+(-?[\\d.]+)%\\s*$").find(s)
-    if (match != null) {
-        val color = parse(s.substring(0, match.range.first).trim()) ?: return null
-        val position = match.groupValues[1].toDoubleOrNull()?.div(100)?.coerceIn(0.0, 1.0)
-        return RawStop(color, position)
+private val STOP_POSITION = Regex("\\s(-?[\\d.]+%|0)\\s*$")
+
+/**
+ * One argument of a gradient's stop list, as the stop(s) it stands for.
+ *
+ * The positions are the trailing `<n>%` (or a unitless `0`); everything before
+ * them is the colour, which may itself contain spaces (`rgba(0, 0, 0, 0.5)`).
+ * CSS allows TWO positions on one stop — `@accent 0 22%` is the same colour at
+ * both, the hard edge the library's progress bars and split panels are drawn
+ * with — so this answers with a list rather than a single stop.
+ */
+private fun parseStops(raw: String, parse: (String) -> Int?): List<RawStop> {
+    var body = raw.trim()
+    if (body.isEmpty()) return emptyList()
+    val positions = mutableListOf<Double>()
+    while (positions.size < 2) {
+        val match = STOP_POSITION.find(body) ?: break
+        val text = match.groupValues[1]
+        val isPercent = text.endsWith("%")
+        val value = (if (isPercent) text.dropLast(1) else text).toDoubleOrNull()
+        // The token comes off `body` either way. Leaving a position this build
+        // could not read attached to the colour made the colour unparseable
+        // too, which dropped the whole stop — and a gradient left with one stop
+        // does not parse at all. A malformed position is worth losing; the stop
+        // is not, so it falls through to the interpolated position instead.
+        body = body.substring(0, match.range.first).trim()
+        if (value == null) break
+        positions.add(0, (if (isPercent) value / 100 else value).coerceIn(0.0, 1.0))
     }
-    return parse(s)?.let { RawStop(it, null) }
+    if (body.isEmpty()) return emptyList()
+    val color = parse(body) ?: return emptyList()
+    if (positions.isEmpty()) return listOf(RawStop(color, null))
+    return positions.map { RawStop(color, it) }
 }
 
 /** Fills in the positions CSS would interpolate for stops that gave none. */
@@ -304,7 +346,7 @@ private fun parseOneGradient(raw: String, parse: (String) -> Int?): RevnixGradie
                 angleForKeyword(head.removePrefix("to ").trim())?.let { angle = it }
                 first = 1
             }
-            val stops = args.drop(first).mapNotNull { parseStop(it, parse) }
+            val stops = args.drop(first).flatMap { parseStops(it, parse) }
             if (stops.size < 2) return null
             // CSS measures clockwise from "to top", so the gradient runs along
             // (sin a, -cos a) in screen coordinates.
@@ -352,7 +394,7 @@ private fun parseOneGradient(raw: String, parse: (String) -> Int?): RevnixGradie
                 centerY = (atOnly.groupValues[2].toDoubleOrNull() ?: 50.0) / 100
                 first = 1
             }
-            val stops = args.drop(first).mapNotNull { parseStop(it, parse) }
+            val stops = args.drop(first).flatMap { parseStops(it, parse) }
             if (stops.size < 2) return null
             val positions = stopPositions(stops)
             return RevnixGradient.Radial(

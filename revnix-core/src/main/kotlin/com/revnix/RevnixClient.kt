@@ -607,6 +607,15 @@ public class RevnixClient(private val config: RevnixConfig) {
         persistQueue(queuedItems().filterNot { it.key == key })
     }
 
+    /**
+     * A block paywall reporting a paint string it could not read. Routed to the
+     * same sink as every other swallowed failure, so a host that already wired
+     * `onDiagnostic` needs no new wiring to see render fallbacks.
+     */
+    public fun reportRenderDiagnostic(message: String) {
+        diagnostic("paywall.render", message)
+    }
+
     private fun diagnostic(op: String, message: String) {
         config.onDiagnostic?.invoke(RevnixDiagnostic(op, message))
     }

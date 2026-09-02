@@ -32,6 +32,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.net.Uri
 import android.util.TypedValue
 import android.view.Gravity
@@ -50,6 +51,8 @@ import com.revnix.RevnixBackgroundLayers
 import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBackgroundLayers
 import com.revnix.revnixBlockColor
+import com.revnix.revnixBlockFill
+import com.revnix.revnixBlockStrokeColor
 import com.revnix.revnixHasCloseAction
 import com.revnix.revnixParseCssGradients
 import com.revnix.revnixResolveTags
@@ -81,6 +84,13 @@ internal class BlockContext(
      * drawn at all — a dead close button is worse than none.
      */
     val onClose: (() -> Unit)? = null,
+    /**
+     * Where the renderer reports a paint string it could not read. Local only —
+     * it never leaves the device. The screen still draws (a fill falls back to
+     * a colour from the design), so this is the only way a host learns that a
+     * paywall is rendering approximately.
+     */
+    val onDiagnostic: ((String) -> Unit)? = null,
 )
 
 /**
@@ -238,10 +248,14 @@ internal class PaywallBlockRenderer(
         is PaywallBlock.Links -> linksRow(block)
 
         is PaywallBlock.Line -> View(context).apply {
-            setBackgroundColor(
-                revnixBlockColor(block.style?.fill, doc)
-                    ?: withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.16),
-            )
+            val fill = revnixBlockFill(block.style?.fill, doc, ctx.onDiagnostic)
+            if (fill.gradients.isEmpty()) {
+                setBackgroundColor(
+                    fill.color ?: withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.16),
+                )
+            } else {
+                background = RevnixGradientDrawable(fill.gradients)
+            }
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(block.style?.height?.px ?: 1.0),
@@ -274,7 +288,7 @@ internal class PaywallBlockRenderer(
         view.text = text
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, (style?.fontSize ?: defaultSizeSp.toDouble()).toFloat())
         view.setTextColor(
-            revnixBlockColor(style?.textColor, doc)
+            revnixBlockStrokeColor(style?.textColor, doc, ctx.onDiagnostic)
                 ?: revnixBlockColor(doc.textColor, doc)
                 ?: Color.WHITE,
         )
@@ -403,17 +417,28 @@ internal class PaywallBlockRenderer(
         val label = textView(revnixResolveTags(block.label, pkg, ctx.packages), block.style)
         label.gravity = Gravity.CENTER
         label.setTextColor(
-            revnixBlockColor(block.style?.textColor, doc)
+            revnixBlockStrokeColor(block.style?.textColor, doc, ctx.onDiagnostic)
                 ?: if (closes) (revnixBlockColor(doc.textColor, doc) ?: Color.WHITE) else ink,
         )
         label.typeface = Typeface.DEFAULT_BOLD
-        val background = GradientDrawable()
-        background.setColor(
-            revnixBlockColor(block.style?.fill, doc)
-                ?: if (closes) Color.TRANSPARENT else accent,
-        )
-        background.cornerRadius = dp(block.style?.radius ?: 12.0).toFloat()
-        label.background = background
+        // `skipBackground` hands the box back to us, so the fill is resolved
+        // here rather than by `applyStyle` — which is why a gradient CTA used
+        // to flatten to the plain accent.
+        val fill = revnixBlockFill(block.style?.fill, doc, ctx.onDiagnostic)
+        val corner = dp(block.style?.radius ?: 12.0).toFloat()
+        label.background = if (fill.gradients.isEmpty()) {
+            GradientDrawable().apply {
+                // The dashboard hands every button's `fill` to CSS
+                // `background`; the close-button rule only decides what happens
+                // when the design set NO fill of its own.
+                val fallback =
+                    if (closes || block.style?.fill != null) Color.TRANSPARENT else accent
+                setColor(fill.color ?: fallback)
+                cornerRadius = corner
+            }
+        } else {
+            RevnixGradientDrawable(fill.gradients, cornerRadius = corner)
+        }
         val vertical = if (block.style?.height != null) 0 else dp(15.0)
         label.setPadding(dp(16.0), vertical, dp(16.0), vertical)
         label.isClickable = true
@@ -784,12 +809,15 @@ internal class PaywallBlockRenderer(
         }
 
         if (!skipBackground) {
-            val fill = revnixBlockColor(style.fill, doc)
-            val borderColor = revnixBlockColor(style.borderColor, doc)
+            val fill = revnixBlockFill(style.fill, doc, ctx.onDiagnostic)
+            val borderColor = revnixBlockStrokeColor(style.borderColor, doc, ctx.onDiagnostic)
             val radius = style.radius
-            if (fill != null || borderColor != null || radius != null) {
+            if (!fill.isNone || borderColor != null || radius != null) {
                 val background = GradientDrawable()
-                if (fill != null) background.setColor(fill)
+                // A gradient's flat base is painted by the layer below instead,
+                // or this shape would cover it.
+                val flat = fill.color
+                if (flat != null && fill.gradients.isEmpty()) background.setColor(flat)
                 radius?.let { background.cornerRadius = dp(it).toFloat() }
                 if (borderColor != null || style.borderWidth != null) {
                     background.setStroke(
@@ -797,7 +825,21 @@ internal class PaywallBlockRenderer(
                         borderColor ?: revnixBlockColor(doc.textColor, doc) ?: Color.WHITE,
                     )
                 }
-                view.background = background
+                // The shape keeps the stroke and the corners and goes ON TOP,
+                // so a gradient fill never paints over its own border.
+                view.background = if (fill.gradients.isEmpty()) {
+                    background
+                } else {
+                    LayerDrawable(
+                        arrayOf(
+                            RevnixGradientDrawable(
+                                fill.gradients,
+                                cornerRadius = dp(radius ?: 0.0).toFloat(),
+                            ),
+                            background,
+                        ),
+                    )
+                }
             }
         }
 
