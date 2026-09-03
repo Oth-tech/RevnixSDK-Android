@@ -282,6 +282,30 @@ public enum class BlockAction {
     }
 }
 
+/**
+ * When a block is drawn, relative to the selected package (REV-262).
+ *
+ * Evaluated against the block's SELECTED CONTEXT — the nearest pinned or
+ * repeat card's package — so a "Selected" caption inside a plan card appears
+ * on the chosen plan only. A block outside any package card has no context
+ * and is always drawn: never hide a root-level block.
+ */
+public enum class BlockVisibility {
+    /** Drawn only while the block's context is the selected package. */
+    Selected,
+    /** Drawn only while it is NOT. */
+    Unselected;
+
+    internal companion object {
+        /** A value this SDK does not know draws the block always. */
+        fun from(value: String?): BlockVisibility? = when (value) {
+            "selected" -> Selected
+            "unselected" -> Unselected
+            else -> null
+        }
+    }
+}
+
 /** One entry of a [PaywallBlock.ListBlock]. */
 public data class BlockListItem(
     public val icon: String? = null,
@@ -301,12 +325,25 @@ public sealed class PaywallBlock {
     public abstract val id: String
     public abstract val style: BlockStyle?
 
+    /**
+     * Merged over [style], field by field, while the block is in selected
+     * context (REV-262) — see [revnixEffectiveStyle]. Valid on EVERY block
+     * type, not only the plan card: a price inside the chosen plan can turn
+     * bold, a radio ring can fill. Ignored outside any package card.
+     */
+    public abstract val selectedStyle: BlockStyle?
+
+    /** Draws the block only in (or only outside) selected context. See [BlockVisibility]. */
+    public abstract val visibility: BlockVisibility?
+
     public data class Text(
         override val id: String,
         public val text: String,
         override val style: BlockStyle? = null,
         /** Tapping this block dismisses the paywall. See [BlockAction]. */
         public val action: BlockAction? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     public data class Image(
@@ -319,6 +356,8 @@ public sealed class PaywallBlock {
         override val style: BlockStyle? = null,
         /** Tapping this block dismisses the paywall. See [BlockAction]. */
         public val action: BlockAction? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     public data class ListBlock(
@@ -327,6 +366,8 @@ public sealed class PaywallBlock {
         /** Icon color; defaults to the screen accent. */
         public val iconColor: String? = null,
         override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     /** Renders the attached offering's packages as selectable cards. */
@@ -340,6 +381,8 @@ public sealed class PaywallBlock {
         public val cardStyle: BlockStyle? = null,
         public val highlightStyle: BlockStyle? = null,
         override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     public data class Button(
@@ -351,6 +394,8 @@ public sealed class PaywallBlock {
          * instead of the purchase CTA, which is what a button means by default.
          */
         public val action: BlockAction? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     public data class Links(
@@ -361,11 +406,15 @@ public sealed class PaywallBlock {
         public val termsUrl: String? = null,
         public val privacyUrl: String? = null,
         override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     public data class Line(
         override val id: String,
         override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     public data class Spacer(
@@ -373,6 +422,8 @@ public sealed class PaywallBlock {
         /** Grows to push what follows to the bottom. */
         public val flex: Boolean? = null,
         override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     /**
@@ -386,7 +437,7 @@ public sealed class PaywallBlock {
         /** Renders this container once per package in the attached offering. */
         public val repeat: String? = null,
         /** Merged over `style` on the package the customer has selected. */
-        public val selectedStyle: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
         /**
          * "This card describes package N of the offering". A card whose index
          * the offering does not reach is hidden.
@@ -398,11 +449,14 @@ public sealed class PaywallBlock {
         public val gridColumns: String? = null,
         public val children: List<PaywallBlock> = emptyList(),
         override val style: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
     /** A block type this SDK does not know. Skipped when drawing. */
     public data class Unknown(override val id: String = "") : PaywallBlock() {
         override val style: BlockStyle? get() = null
+        override val selectedStyle: BlockStyle? get() = null
+        override val visibility: BlockVisibility? get() = null
     }
 }
 
@@ -476,10 +530,14 @@ public data class PaywallBlockDoc(
             fun s(key: String) = o[key]?.stringOrNull
             fun b(key: String) = o[key]?.booleanOrNullSafe
             val action = BlockAction.from(s("action"))
+            // Valid on every block type (REV-262), so read once here.
+            val selectedStyle = BlockStyle.from(o["selectedStyle"])
+            val visibility = BlockVisibility.from(s("visibility"))
             return when (o["type"]?.stringOrNull) {
-                "text" -> PaywallBlock.Text(id, s("text") ?: "", style, action)
+                "text" -> PaywallBlock.Text(id, s("text") ?: "", style, action, selectedStyle, visibility)
                 "image" -> PaywallBlock.Image(
                     id, s("url"), s("shape"), s("fit"), s("placeholder"), style, action,
+                    selectedStyle, visibility,
                 )
                 "list" -> PaywallBlock.ListBlock(
                     id,
@@ -491,30 +549,33 @@ public data class PaywallBlockDoc(
                             description = io["description"]?.stringOrNull,
                         )
                     },
-                    s("iconColor"), style,
+                    s("iconColor"), style, selectedStyle, visibility,
                 )
                 "products" -> PaywallBlock.Products(
                     id, s("direction"), s("titleTpl"), s("priceTpl"), s("highlightSub"),
                     s("badgeText"), BlockStyle.from(o["cardStyle"]),
-                    BlockStyle.from(o["highlightStyle"]), style,
+                    BlockStyle.from(o["highlightStyle"]), style, selectedStyle, visibility,
                 )
-                "button" -> PaywallBlock.Button(id, s("label") ?: "", style, action)
+                "button" -> PaywallBlock.Button(
+                    id, s("label") ?: "", style, action, selectedStyle, visibility,
+                )
                 "links" -> PaywallBlock.Links(
                     id, b("showRestore"), b("showTerms"), b("showPrivacy"),
-                    s("termsUrl"), s("privacyUrl"), style,
+                    s("termsUrl"), s("privacyUrl"), style, selectedStyle, visibility,
                 )
-                "line" -> PaywallBlock.Line(id, style)
-                "spacer" -> PaywallBlock.Spacer(id, b("flex"), style)
+                "line" -> PaywallBlock.Line(id, style, selectedStyle, visibility)
+                "spacer" -> PaywallBlock.Spacer(id, b("flex"), style, selectedStyle, visibility)
                 "card" -> PaywallBlock.Card(
                     id = id,
                     layout = s("layout"),
                     repeat = s("repeat"),
-                    selectedStyle = BlockStyle.from(o["selectedStyle"]),
+                    selectedStyle = selectedStyle,
                     packageIndex = o["packageIndex"]?.intOrNullSafe,
                     columns = o["columns"]?.intOrNullSafe,
                     gridColumns = s("gridColumns"),
                     children = (o["children"] as? JsonArray).orEmpty().map { parseBlock(it) },
                     style = style,
+                    visibility = visibility,
                 )
                 // A block type from a newer dashboard. Skipped when drawing.
                 else -> PaywallBlock.Unknown(id)
@@ -854,6 +915,10 @@ private fun JsonElement.asArrayOrNull(): JsonArray? = runCatching { jsonArray }.
  * same predicate exists in every Revnix SDK — keep them identical.
  */
 public fun revnixHasCloseAction(blocks: List<PaywallBlock>): Boolean = blocks.any { block ->
+    // A block with `visibility` set is drawn only in one selection state, so
+    // a close authored on it is not certain to be on screen (REV-262). It is
+    // skipped for the same reason the conditional containers below are.
+    if (block.visibility != null) return@any false
     when (block) {
         is PaywallBlock.Text -> block.action == BlockAction.Close
         is PaywallBlock.Image -> block.action == BlockAction.Close

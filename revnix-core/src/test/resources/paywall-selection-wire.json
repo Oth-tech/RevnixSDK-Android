@@ -1,0 +1,149 @@
+{
+  "contract": "cto-review/2026-09-03-paywall-render-contract-v2.md",
+  "doc": {
+    "version": 1,
+    "layout": "flow",
+    "background": "#000000",
+    "textColor": "#ffffff",
+    "accent": "#00ff00",
+    "accentInk": "#000000",
+    "blocks": [
+      {
+        "id": "plans",
+        "type": "card",
+        "layout": "column",
+        "children": [
+          {
+            "id": "c0",
+            "type": "card",
+            "layout": "row",
+            "packageIndex": 0,
+            "style": { "fill": "#111111", "borderColor": "#333333", "borderWidth": 1, "radius": 16 },
+            "selectedStyle": { "fill": "#222222", "borderColor": "@accent" },
+            "children": [
+              {
+                "id": "c0-ring",
+                "type": "card",
+                "layout": "column",
+                "style": { "width": 20, "height": 20, "radius": 9999, "borderWidth": 2, "borderColor": "#555555" },
+                "selectedStyle": { "borderColor": "@accent" },
+                "children": [
+                  {
+                    "id": "c0-dot",
+                    "type": "card",
+                    "layout": "column",
+                    "visibility": "selected",
+                    "style": { "width": 10, "height": 10, "radius": 9999, "fill": "@accent" },
+                    "children": []
+                  }
+                ]
+              },
+              { "id": "c0-title", "type": "text", "text": "{title} — {price}/{period_short}" },
+              { "id": "c0-on", "type": "text", "text": "Selected", "visibility": "selected" },
+              { "id": "c0-off", "type": "text", "text": "Tap to select", "visibility": "unselected" }
+            ]
+          },
+          {
+            "id": "c1",
+            "type": "card",
+            "layout": "row",
+            "packageIndex": 1,
+            "style": { "fill": "#111111", "borderColor": "#333333", "borderWidth": 1, "radius": 16 },
+            "selectedStyle": { "fill": "#222222", "borderColor": "@accent" },
+            "children": [
+              {
+                "id": "c1-ring",
+                "type": "card",
+                "layout": "column",
+                "style": { "width": 20, "height": 20, "radius": 9999, "borderWidth": 2, "borderColor": "#555555" },
+                "selectedStyle": { "borderColor": "@accent" },
+                "children": [
+                  {
+                    "id": "c1-dot",
+                    "type": "card",
+                    "layout": "column",
+                    "visibility": "selected",
+                    "style": { "width": 10, "height": 10, "radius": 9999, "fill": "@accent" },
+                    "children": []
+                  }
+                ]
+              },
+              { "id": "c1-title", "type": "text", "text": "{title} — {price}/{period_short}" },
+              { "id": "c1-on", "type": "text", "text": "Selected", "visibility": "selected" },
+              { "id": "c1-off", "type": "text", "text": "Tap to select", "visibility": "unselected" }
+            ]
+          }
+        ]
+      },
+      { "id": "footer", "type": "text", "text": "7 days free, then {price}/{period_short}. Cancel anytime." },
+      { "id": "root-hidden", "type": "text", "text": "always drawn", "visibility": "selected" },
+      { "id": "cta", "type": "button", "label": "Continue" }
+    ]
+  },
+  "packages": [
+    { "packageId": "monthly", "title": "Monthly", "priceLabel": "$9.99", "period": "monthly", "amountMinor": 999, "currency": "USD" },
+    { "packageId": "yearly", "title": "Yearly", "priceLabel": "$59.99", "period": "annual", "amountMinor": 5999, "currency": "USD" }
+  ],
+  "cases": [
+    {
+      "name": "host selects yearly",
+      "selected": "yearly",
+      "highlight": null,
+      "styles": {
+        "c0": { "fill": "#111111", "borderColor": "#333333", "borderWidth": 1 },
+        "c1": { "fill": "#222222", "borderColor": "@accent", "borderWidth": 1 },
+        "c0-ring": { "borderColor": "#555555" },
+        "c1-ring": { "borderColor": "@accent" }
+      },
+      "visible": ["c1-dot", "c1-on", "c0-off", "root-hidden", "footer", "cta"],
+      "hidden": ["c0-dot", "c0-on", "c1-off"],
+      "texts": {
+        "c0-title": "Monthly — $9.99/mo",
+        "c1-title": "Yearly — $59.99/yr",
+        "footer": "7 days free, then $59.99/yr. Cancel anytime."
+      }
+    },
+    {
+      "name": "host selects monthly",
+      "selected": "monthly",
+      "highlight": null,
+      "styles": {
+        "c0": { "fill": "#222222", "borderColor": "@accent", "borderWidth": 1 },
+        "c1": { "fill": "#111111", "borderColor": "#333333", "borderWidth": 1 },
+        "c0-ring": { "borderColor": "@accent" },
+        "c1-ring": { "borderColor": "#555555" }
+      },
+      "visible": ["c0-dot", "c0-on", "c1-off", "root-hidden", "footer", "cta"],
+      "hidden": ["c1-dot", "c1-on", "c0-off"],
+      "texts": {
+        "c0-title": "Monthly — $9.99/mo",
+        "c1-title": "Yearly — $59.99/yr",
+        "footer": "7 days free, then $9.99/mo. Cancel anytime."
+      }
+    },
+    {
+      "name": "no host selection, highlight yearly",
+      "selected": null,
+      "highlight": "yearly",
+      "styles": {
+        "c0": { "fill": "#111111", "borderColor": "#333333", "borderWidth": 1 },
+        "c1": { "fill": "#222222", "borderColor": "@accent", "borderWidth": 1 }
+      },
+      "visible": ["c1-dot", "c1-on", "c0-off", "root-hidden"],
+      "hidden": ["c0-dot", "c0-on", "c1-off"],
+      "texts": { "footer": "7 days free, then $59.99/yr. Cancel anytime." }
+    },
+    {
+      "name": "no selection, no highlight: first package",
+      "selected": null,
+      "highlight": null,
+      "styles": {
+        "c0": { "fill": "#222222", "borderColor": "@accent", "borderWidth": 1 },
+        "c1": { "fill": "#111111", "borderColor": "#333333", "borderWidth": 1 }
+      },
+      "visible": ["c0-dot", "c0-on", "c1-off", "root-hidden"],
+      "hidden": ["c1-dot", "c1-on", "c0-off"],
+      "texts": { "footer": "7 days free, then $9.99/mo. Cancel anytime." }
+    }
+  ]
+}
