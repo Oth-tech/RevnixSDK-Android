@@ -50,6 +50,7 @@ import com.revnix.BlockPackage
 import com.revnix.PaywallBlockDoc
 import com.revnix.PaywallConfig
 import com.revnix.RevnixClient
+import com.revnix.RevnixPaywallEvent
 import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBlockColor
 import com.revnix.revnixSelectedPackageId
@@ -84,6 +85,13 @@ public data class RevnixPaywallPackage(
      */
     val amountMinor: Long? = null,
     val currency: String? = null,
+    /**
+     * REV-263: the catalog product behind this package. Only telemetry reads
+     * it — a `Selected` or `PurchaseStarted` report names the plan the way the
+     * rest of the ledger does. Optional: without it the interaction is still
+     * reported, just with no plan attached.
+     */
+    val productId: String? = null,
 )
 
 /**
@@ -190,6 +198,8 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private var onPurchase: ((String) -> Unit)? = null
     private var onSelectPackage: ((String) -> Unit)? = null
     private var onRestore: (() -> Unit)? = null
+    /** REV-263: rises per CTA press, so a retry is its own occurrence. */
+    private var purchaseAttempts = 0
     private var onTerms: (() -> Unit)? = null
     private var onPrivacy: (() -> Unit)? = null
     private var onClose: (() -> Unit)? = null
@@ -340,7 +350,85 @@ public class RevnixPaywallView @JvmOverloads constructor(
             // Fire-and-forget; the client swallows failures into diagnostics
             // and dispatches to IO internally.
             viewReport = viewScope.async { client.logPaywallDisplay(placementKey, paywallId) }
+            // REV-263: an offering with nothing to sell is the one failure the
+            // view can see by itself, and the one most worth knowing about —
+            // the paywall painted, the customer could not buy.
+            if (packages.isEmpty()) {
+                reportInteraction(
+                    RevnixPaywallEvent.Error,
+                    code = "no_products",
+                    message = "paywall displayed with no packages",
+                )
+            }
         }
+    }
+
+    // ——— REV-263: the interaction vocabulary ———
+    //
+    // The view reports what it genuinely OBSERVES: the selection change, the
+    // CTA press, the restore press, and an offering that arrived with nothing
+    // to sell. It never reports the purchase OUTCOME — the Play Billing call
+    // happens in the host, so only the host knows whether the customer
+    // cancelled (`USER_CANCELED`) or the payment was refused. Report those
+    // with `client.logPaywallEvent(...)` from your own BillingResult handling.
+    private fun reportInteraction(
+        event: RevnixPaywallEvent,
+        productId: String? = null,
+        code: String? = null,
+        message: String? = null,
+        eventId: String? = null,
+    ) {
+        val client = reportingClient ?: return
+        val report = viewReport ?: return
+        val placementKey = reportPlacementKey
+        val paywallId = reportPaywallId
+        viewScope.launch {
+            // Awaiting the view beacon for the same reason the close does: an
+            // interaction reported before the display id exists could not be
+            // tied to the display it happened on.
+            val id = runCatching { report.await() }.getOrNull() ?: return@launch
+            client.logPaywallEvent(
+                event = event,
+                viewId = id,
+                placementKey = placementKey,
+                paywallId = paywallId,
+                productId = productId,
+                code = code,
+                message = message,
+                eventId = eventId?.let { "$id:$it" },
+            )
+        }
+    }
+
+    /**
+     * The catalog product behind a package, so a report names the plan the way
+     * the rest of the ledger does. Null when the offering did not carry one —
+     * reporting the package id instead would look like a product that does not
+     * exist.
+     */
+    private fun productIdFor(packageId: String): String? =
+        packages.firstOrNull { it.packageId == packageId }?.productId
+
+    /**
+     * Checkout start. Every CTA path routes through here, so the report can
+     * never be wired on one render path and forgotten on the other. The
+     * attempt counter rises per press so a retry after a failure is its own
+     * occurrence rather than a duplicate of the first try.
+     */
+    private fun purchaseAndReport(packageId: String) {
+        purchaseAttempts += 1
+        reportInteraction(
+            RevnixPaywallEvent.PurchaseStarted,
+            productId = productIdFor(packageId),
+            eventId = "buy:$purchaseAttempts",
+        )
+        onPurchase?.invoke(packageId)
+    }
+
+    /** Restore — the report rides along with the host's handler. */
+    private fun restoreAndReport() {
+        reportInteraction(RevnixPaywallEvent.Restore)
+        onRestore?.invoke()
     }
 
     /**
@@ -1216,7 +1304,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         ctaSpinner = spinner
         cta.setOnClickListener {
             val selectedId = currentSelectedId()
-            if (!loading && selectedId != null) onPurchase?.invoke(selectedId)
+            if (!loading && selectedId != null) purchaseAndReport(selectedId)
         }
         column.addBlock(cta, bottom = 14)
     }
@@ -1232,7 +1320,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private fun addFooter(column: LinearLayout, ctx: Ctx) {
         val footer = ctx.config.footer
         val items = mutableListOf<FooterItem>()
-        if (footer?.showRestore != false) items += FooterItem("Restore", onRestore)
+        if (footer?.showRestore != false) {
+            items += FooterItem("Restore", onRestore?.let { { restoreAndReport() } })
+        }
         if (footer?.showTerms != false) items += FooterItem("Terms", onTerms ?: openUrlAction(footer?.termsUrl))
         if (footer?.showPrivacy != false) items += FooterItem("Privacy", onPrivacy ?: openUrlAction(footer?.privacyUrl))
         if (items.isEmpty()) return
@@ -1275,6 +1365,14 @@ public class RevnixPaywallView @JvmOverloads constructor(
 
     private fun select(packageId: String) {
         internalSelected = packageId
+        // REV-263: one report per (display, package) — a customer toggling
+        // monthly → yearly → monthly weighed two plans, not three, and the
+        // server's default key (the viewId alone) would keep only the first.
+        reportInteraction(
+            RevnixPaywallEvent.Selected,
+            productId = productIdFor(packageId),
+            eventId = "sel:$packageId",
+        )
         onSelectPackage?.invoke(packageId)
         // A designed paywall's selected treatment is structural, not just a
         // border: a badge and a sub-line appear, and an arbitrary
@@ -1484,9 +1582,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     heroImageUrl = config.heroImageUrl,
                     footerTermsUrl = config.footer?.termsUrl,
                     footerPrivacyUrl = config.footer?.privacyUrl,
-                    onPurchase = { id -> if (!loading) onPurchase?.invoke(id) },
+                    onPurchase = { id -> if (!loading) purchaseAndReport(id) },
                     onSelect = { id -> select(id) },
-                    onRestore = onRestore,
+                    onRestore = onRestore?.let { { restoreAndReport() } },
                     onTerms = onTerms,
                     onPrivacy = onPrivacy,
                     onClose = onClose?.let { { closeAndReport() } },

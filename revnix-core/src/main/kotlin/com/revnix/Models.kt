@@ -104,6 +104,32 @@ public data class RegisterPurchaseResult(
     val provisional: Boolean? = null,
 )
 
+/**
+ * REV-263: the six paywall interactions [RevnixClient.logPaywallEvent] can
+ * report — what the customer did on a display, between the view that opened it
+ * and the close or purchase that ended it. The server turns each into the
+ * ledger type `paywall.<wireName>`.
+ */
+public enum class RevnixPaywallEvent(public val wireName: String) {
+    /** A package was picked. */
+    Selected("selected"),
+
+    /** Checkout was started. */
+    PurchaseStarted("purchase_started"),
+
+    /** The customer backed out at the store sheet (`USER_CANCELED`). */
+    PurchaseAbandoned("purchase_abandoned"),
+
+    /** The store refused the payment. */
+    PurchaseFailed("purchase_failed"),
+
+    /** Restore purchases was tapped. */
+    Restore("restore"),
+
+    /** The paywall itself failed — config, products, or render. */
+    Error("error"),
+}
+
 // ——— GET /v1/placements/{key}/offering ———
 
 @Serializable
