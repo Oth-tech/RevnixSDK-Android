@@ -397,6 +397,61 @@ public class RevnixClient(private val config: RevnixConfig) {
 
 
     /**
+     * Report one of the six paywall interactions (REV-263) — what the customer
+     * DID on a display, between the [logPaywallDisplay] that opened it and the
+     * [logPaywallClosed] (or purchase) that ended it.
+     *
+     * Fire-and-forget like the other beacons: never throws.
+     *
+     * [viewId] is the id [logPaywallDisplay] returned for THIS display.
+     * Passing it is what threads the whole life of one impression together and
+     * puts the event on the paywall's own analytics row.
+     *
+     * `RevnixPaywallView` reports [RevnixPaywallEvent.Selected],
+     * [RevnixPaywallEvent.PurchaseStarted], [RevnixPaywallEvent.Restore] and a
+     * no-products [RevnixPaywallEvent.Error] for you. The purchase OUTCOME is
+     * yours: only your app performs the Play Billing call, so report
+     * [RevnixPaywallEvent.PurchaseAbandoned] / [RevnixPaywallEvent.PurchaseFailed]
+     * from your own `BillingResult` handling (`USER_CANCELED` is an
+     * abandonment, anything else is a failure).
+     *
+     * [eventId] is the idempotency key and defaults to [viewId], which caps
+     * the report at one per display per event. Pass one per occurrence — and
+     * reuse it across your own retries — to record each occurrence.
+     */
+    public suspend fun logPaywallEvent(
+        event: RevnixPaywallEvent,
+        viewId: String,
+        placementKey: String? = null,
+        paywallId: String? = null,
+        productId: String? = null,
+        code: String? = null,
+        message: String? = null,
+        eventId: String? = null,
+    ) {
+        val body = buildJsonObject {
+            put("customerId", JsonPrimitive(customerId()))
+            put("viewId", JsonPrimitive(viewId))
+            put("event", JsonPrimitive(event.wireName))
+            put("sdkVersion", JsonPrimitive(SDK_VERSION))
+            eventId?.let { put("eventId", JsonPrimitive(it)) }
+            placementKey?.let { put("placementKey", JsonPrimitive(it)) }
+            paywallId?.let { put("paywallId", JsonPrimitive(it)) }
+            productId?.let { put("productId", JsonPrimitive(it)) }
+            code?.let { put("code", JsonPrimitive(it)) }
+            // The server bounds `message` at 1024; trimming here keeps a long
+            // localized store error from turning the whole report into a 400.
+            message?.let { put("message", JsonPrimitive(it.take(1024))) }
+        }
+        try {
+            request("POST", listOf("v1", "paywalls", "events"), body)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("logPaywallEvent", err.message.orEmpty())
+        }
+    }
+
+    /**
      * Set attributes on the current customer (REV-033 v2). Attributes are what
      * A/B-test audiences target — set `country`, `app_version`, `locale`, or
      * any custom key you want to segment on. A null value deletes the key.
