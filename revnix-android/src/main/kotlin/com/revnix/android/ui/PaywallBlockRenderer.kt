@@ -8,7 +8,11 @@
 //
 // revnix-app's src/components/paywall-blocks/BlockScreen.tsx is the reference
 // renderer; keep the two in lockstep. The model and its parser live in the
-// core (com.revnix.PaywallBlockDoc), which is plain Kotlin and JVM-testable.
+// core (com.revnix.PaywallBlockDoc), which is plain Kotlin and JVM-testable,
+// and so does the selection logic (com.revnix.PaywallSelection.kt): which
+// package is selected, which style a block takes in that state and whether it
+// is drawn at all are pure functions this file only APPLIES. The render
+// contract (REV-262) pins those rules across all seven renderers.
 //
 // Built from programmatic classic Views, like the rest of this SDK: the
 // container layouts map onto LinearLayout (column / row), FrameLayout (stack)
@@ -29,21 +33,31 @@ package com.revnix.android.ui
 
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Outline
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.net.Uri
+import android.os.Build
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
+import android.view.WindowInsets
 import android.widget.FrameLayout
 import android.widget.GridLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import com.revnix.BlockAction
 import com.revnix.BlockPackage
+import com.revnix.BlockSelectionContext
 import com.revnix.BlockStyle
 import com.revnix.PaywallBlock
 import com.revnix.PaywallBlockDoc
@@ -53,9 +67,16 @@ import com.revnix.revnixBackgroundLayers
 import com.revnix.revnixBlockColor
 import com.revnix.revnixBlockFill
 import com.revnix.revnixBlockStrokeColor
+import com.revnix.revnixCardContext
+import com.revnix.revnixEffectiveStyle
 import com.revnix.revnixHasCloseAction
+import com.revnix.revnixIsBlockVisible
+import com.revnix.revnixPackageContext
 import com.revnix.revnixParseCssGradients
 import com.revnix.revnixResolveTags
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /** Everything the tree needs that is not in the document itself. */
@@ -63,8 +84,11 @@ internal class BlockContext(
     val doc: PaywallBlockDoc,
     val packages: List<BlockPackage>,
     /**
-     * The package a plan card visually emphasizes, and the one whose tags a
-     * subtree resolves against outside a `repeat`.
+     * The selected package — already resolved by the view through
+     * `revnixSelectedPackageId` (host selection → tap → highlight → first),
+     * so it always names an offered package when there is one. Plan cards
+     * emphasize it, and copy outside any plan card resolves its tags against
+     * it.
      */
     val selectedPackageId: String?,
     val heroImageUrl: String?,
@@ -84,6 +108,12 @@ internal class BlockContext(
      * drawn at all — a dead close button is worse than none.
      */
     val onClose: (() -> Unit)? = null,
+    /**
+     * The host's `loading` flag. Purchase buttons draw a spinner in place of
+     * their label and ignore taps while it is set; close buttons are
+     * unaffected. Swallowing the tap with no visual was the bug (REV-262).
+     */
+    val loading: Boolean = false,
     /**
      * Where the renderer reports a paint string it could not read. Local only —
      * it never leaves the device. The screen still draws (a fill falls back to
@@ -105,8 +135,18 @@ internal class PaywallBlockRenderer(
 ) {
     private val doc = ctx.doc
     private val density = context.resources.displayMetrics.density
+    private val selectedPackage: BlockPackage? =
+        ctx.packages.firstOrNull { it.packageId == ctx.selectedPackageId }
 
     private fun dp(value: Double): Int = (value * density).roundToInt()
+
+    /**
+     * A drawn block and the style it was drawn with. The parent needs the
+     * style too — it is what sizes and places the child — and it is the
+     * EFFECTIVE style (with `selectedStyle` merged in selected context), which
+     * only the child's own render knows.
+     */
+    private class Drawn(val view: View, val style: BlockStyle?)
 
     /**
      * The gradient, photo and scrim layers, bottom first. Empty for an
@@ -139,13 +179,16 @@ internal class PaywallBlockRenderer(
     /**
      * The whole screen.
      *
-     * A `canvas` document is authored against a fixed 393×852 device screen; it
-     * is laid out at that size and scaled as a whole, so absolute placement
-     * inside `stack` containers stays true at any width. A `flow` document lays
-     * out as an ordinary column.
+     * A `canvas` document is authored against a fixed 393×852 device screen.
+     * It is laid out at 393 design units wide and scaled uniformly by the
+     * viewport width (capped at 480dp, so a phone design never balloons on a
+     * tablet), centred, with the document background filling the whole
+     * viewport around it. Its height stretches to fill a taller viewport and
+     * SCROLLS on a shorter one — never a band, never a clipped CTA. A `flow`
+     * document lays out as an ordinary scrolling column.
      */
     fun renderScreen(): View {
-        val screen = FrameLayout(context)
+        val screen = InsetRequestingFrame(context)
         val layers = revnixBackgroundLayers(doc.backgroundSpec)
         // The flat colour under everything. A gradient ground resolves to its
         // first stop here, so a form the parser does not understand still
@@ -158,43 +201,66 @@ internal class PaywallBlockRenderer(
             orientation = LinearLayout.VERTICAL
             clipChildren = false
         }
+        var placed = 0
         for (block in doc.blocks) {
-            render(block, null)?.let { body.addView(it) }
+            val drawn = render(block, BlockSelectionContext.NONE) ?: continue
+            body.addView(drawn.view, lineParams(block, drawn.style, placed++, gap = 0, horizontal = false))
         }
 
+        // Scroll indicators hidden and no bounce while the content fits, on
+        // both layouts. `OVER_SCROLL_IF_CONTENT_SCROLLS` is exactly that rule.
+        val scroll = CanvasScroll(context).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            clipChildren = false
+            clipToPadding = false
+        }
         if (doc.layout == "canvas") {
-            val canvasWidth = dp(PaywallBlockDoc.CANVAS_WIDTH.toDouble())
-            val canvasHeight = dp(PaywallBlockDoc.CANVAS_HEIGHT.toDouble())
-            body.layoutParams = FrameLayout.LayoutParams(canvasWidth, canvasHeight)
-            body.pivotX = 0f
-            body.pivotY = 0f
-            screen.addView(body)
-            // The container's width is not known until it is measured, so the
-            // scale is applied on layout rather than guessed here.
-            screen.addOnLayoutChangeListener { _, left, _, right, _, _, _, _, _ ->
-                val width = right - left
-                if (width <= 0) return@addOnLayoutChangeListener
-                val scale = width.toFloat() / canvasWidth
-                body.scaleX = scale
-                body.scaleY = scale
-            }
-            // Added AFTER the scaled body, and never inside it, so the
-            // fallback close keeps its tap size and its distance from the
-            // screen edge whatever the device width does to the design.
-            fallbackClose()?.let { screen.addView(it) }
-            return screen
+            val stage = CanvasStage(
+                context, body,
+                canvasWidth = dp(PaywallBlockDoc.CANVAS_WIDTH.toDouble()),
+                minHeight = dp(PaywallBlockDoc.CANVAS_HEIGHT.toDouble()),
+                maxWidth = dp(CANVAS_MAX_WIDTH),
+            )
+            scroll.stage = stage
+            scroll.addView(
+                stage,
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            )
+        } else {
+            // fillViewport so a flex spacer can still push the CTA to the
+            // bottom of a screen the column does not fill.
+            scroll.isFillViewport = true
+            scroll.addView(
+                body,
+                FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+            )
         }
+        screen.addView(scroll, revnixFillParams())
 
-        screen.addView(
-            body,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ),
-        )
-        fallbackClose()?.let { screen.addView(it) }
+        // Added AFTER the scroll, and never inside the scaled body, so the
+        // fallback close keeps its tap size and its distance from the screen
+        // edge whatever the device width does to the design — and sits below
+        // the status bar when the host draws edge to edge.
+        fallbackClose()?.let { chip ->
+            screen.addView(chip)
+            screen.setOnApplyWindowInsetsListener { _, insets ->
+                val params = chip.layoutParams as FrameLayout.LayoutParams
+                params.topMargin = dp(CLOSE_INSET) + statusBarInset(insets)
+                chip.layoutParams = params
+                insets
+            }
+        }
         return screen
     }
+
+    private fun statusBarInset(insets: WindowInsets): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            insets.getInsets(WindowInsets.Type.statusBars()).top
+        } else {
+            @Suppress("DEPRECATION")
+            insets.systemWindowInsetTop
+        }
 
     /**
      * The dismiss affordance the renderer supplies itself (REV-252), or null
@@ -214,7 +280,7 @@ internal class PaywallBlockRenderer(
         if (revnixHasCloseAction(doc.blocks)) return null
         val ink = revnixBlockColor(doc.textColor, doc) ?: Color.WHITE
         val glyph = TextView(context).apply {
-            text = "\u00d7"
+            text = "×"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             setTextColor(ink)
             gravity = Gravity.CENTER
@@ -227,58 +293,64 @@ internal class PaywallBlockRenderer(
             setOnClickListener { onClose() }
         }
         glyph.layoutParams = FrameLayout.LayoutParams(dp(30.0), dp(30.0), Gravity.TOP or Gravity.END)
-            .apply { topMargin = dp(14.0); marginEnd = dp(14.0) }
+            .apply { topMargin = dp(CLOSE_INSET); marginEnd = dp(CLOSE_INSET) }
         return glyph
     }
 
-    /** One block, or null when it contributes nothing. */
-    private fun render(block: PaywallBlock, pkg: BlockPackage?): View? = when (block) {
-        is PaywallBlock.Text -> textView(
-            revnixResolveTags(block.text, pkg, ctx.packages), block.style,
-        ).also { closeOnTap(it, block.action) }
+    /**
+     * One block in its parent's selected context, or null when it contributes
+     * nothing: unknown, hidden in this selection state, or a card pinned past
+     * the offering. Cards establish their own context (see [card]); every
+     * other block takes its style and visibility from the one it is in, and
+     * resolves its copy against that context's package — the SELECTED package
+     * when it sits outside any plan card.
+     */
+    private fun render(block: PaywallBlock, parent: BlockSelectionContext): Drawn? {
+        if (block is PaywallBlock.Card) return card(block, parent)
+        if (!revnixIsBlockVisible(block, parent)) return null
+        val style = revnixEffectiveStyle(block, parent)
+        val pkg = parent.tagPackage(selectedPackage)
+        val view: View = when (block) {
+            is PaywallBlock.Text -> textView(
+                revnixResolveTags(block.text, pkg, ctx.packages), style,
+            ).also { closeOnTap(it, block.action) }
 
-        is PaywallBlock.Image -> imageSlot(block).also { closeOnTap(it, block.action) }
+            is PaywallBlock.Image -> imageSlot(block, style).also { closeOnTap(it, block.action) }
 
-        is PaywallBlock.ListBlock -> listColumn(block)
+            is PaywallBlock.ListBlock -> listColumn(block, style)
 
-        is PaywallBlock.Products -> productsColumn(block)
+            is PaywallBlock.Products -> productsColumn(block, style)
 
-        is PaywallBlock.Button -> buttonView(block, pkg)
+            is PaywallBlock.Button -> buttonView(block, style, pkg)
 
-        is PaywallBlock.Links -> linksRow(block)
+            is PaywallBlock.Links -> linksRow(block, style) ?: return null
 
-        is PaywallBlock.Line -> View(context).apply {
-            val fill = revnixBlockFill(block.style?.fill, doc, ctx.onDiagnostic)
-            if (fill.gradients.isEmpty()) {
-                setBackgroundColor(
-                    fill.color ?: withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.16),
-                )
-            } else {
-                background = RevnixGradientDrawable(fill.gradients)
+            is PaywallBlock.Line -> View(context).apply {
+                val fill = revnixBlockFill(style?.fill, doc, ctx.onDiagnostic)
+                if (fill.gradients.isEmpty()) {
+                    setBackgroundColor(
+                        fill.color ?: withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.16),
+                    )
+                } else {
+                    background = RevnixGradientDrawable(fill.gradients)
+                }
+                // The parent sizes the view from the style; a line with no
+                // height set is a hairline, not nothing.
+                minimumHeight = dp(style?.height?.px ?: 1.0)
+                applyStyle(this, style, skipBackground = true)
             }
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(block.style?.height?.px ?: 1.0),
-            )
-            applyStyle(this, block.style, skipBackground = true)
-        }
 
-        is PaywallBlock.Spacer -> View(context).apply {
-            layoutParams = if (block.flex == true) {
-                // Grows to push what follows to the bottom.
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0).apply { weight = 1f }
-            } else {
-                LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    dp(block.style?.height?.px ?: 16.0),
-                )
+            is PaywallBlock.Spacer -> View(context).apply {
+                if (block.flex != true) minimumHeight = dp(style?.height?.px ?: 16.0)
             }
+
+            // Handled above; listed so the `when` stays exhaustive.
+            is PaywallBlock.Card -> return null
+
+            // A block type from a newer dashboard: skip it, keep the screen.
+            is PaywallBlock.Unknown -> return null
         }
-
-        is PaywallBlock.Card -> card(block, pkg)
-
-        // A block type from a newer dashboard: skip it, keep the screen.
-        is PaywallBlock.Unknown -> null
+        return Drawn(view, style)
     }
 
     // ——— leaves ———
@@ -321,21 +393,35 @@ internal class PaywallBlockRenderer(
         return view
     }
 
-    private fun imageSlot(block: PaywallBlock.Image): View {
-        // Image loading is the host app's job — this SDK ships no image
-        // library — so a slot draws as its placeholder box. A design that
-        // publishes a URL still reserves the right space for it.
-        val style = block.style
+    /**
+     * An image block: the photo, loaded through the same cached fetch the
+     * background uses, over a placeholder that stays only while nothing has
+     * loaded. An empty URL falls back to the config's hero image, then to the
+     * placeholder alone. `fit` and `shape` apply; `inset` fills a stack.
+     */
+    private fun imageSlot(block: PaywallBlock.Image, style: BlockStyle?): View {
+        // The 160dp default suits a slot dropped into a flow column; a
+        // converted design sizes its own slot (pinned edges, explicit box),
+        // and the default must not fight it. Same rule as the dashboard.
         val sized = style != null &&
-            (style.inset == true || style.height != null || style.aspectRatio != null || style.flex != null)
-        val slot = FrameLayout(context)
-        slot.setBackgroundColor(Color.argb(56, 125, 135, 155))
-        val label = block.placeholder ?: block.url
-        if (!label.isNullOrEmpty()) {
-            val text = textView(label, null, defaultSizeSp = 10.5f)
+            (
+                style.inset == true || style.height != null || style.aspectRatio != null ||
+                    style.flex != null || (style.top != null && style.bottom != null)
+                )
+        val url = block.url?.takeIf { it.isNotBlank() } ?: ctx.heroImageUrl?.takeIf { it.isNotBlank() }
+        val round = block.shape == "circle"
+
+        val ratio = style?.aspectRatio?.ratio
+        val slot: FrameLayout = if (ratio != null && ratio > 0) AspectFrame(context, ratio) else FrameLayout(context)
+        if (!sized) slot.minimumHeight = dp(160.0)
+
+        val placeholder = FrameLayout(context)
+        placeholder.setBackgroundColor(Color.argb(56, 125, 135, 155))
+        if (url == null) {
+            val text = textView(block.placeholder ?: "image", null, defaultSizeSp = 10.5f)
             text.gravity = Gravity.CENTER
             text.alpha = 0.62f
-            slot.addView(
+            placeholder.addView(
                 text,
                 FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -344,18 +430,40 @@ internal class PaywallBlockRenderer(
                 ),
             )
         }
-        if (!sized) {
-            slot.layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(160.0),
-            )
+        slot.addView(placeholder, revnixFillParams())
+
+        if (url != null) {
+            val image = RevnixBlockImageView(context, url) { placeholder.visibility = View.GONE }
+            image.scaleType = if (block.fit == "contain") ImageView.ScaleType.FIT_CENTER else ImageView.ScaleType.CENTER_CROP
+            slot.addView(image, revnixFillParams())
+        }
+
+        // The photo clips to the slot's shape: a circle, the design's radius,
+        // or the 16dp a bare flow slot gets — the dashboard's `overflow:
+        // hidden` on the same box.
+        val radius = dp(style?.radius ?: if (sized) 0.0 else 16.0).toFloat()
+        if (round || radius > 0f) {
+            slot.outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    if (round) {
+                        val size = min(view.width, view.height)
+                        val left = (view.width - size) / 2
+                        val top = (view.height - size) / 2
+                        outline.setOval(left, top, left + size, top + size)
+                    } else {
+                        outline.setRoundRect(0, 0, view.width, view.height, radius)
+                    }
+                }
+            }
+            slot.clipToOutline = true
         }
         applyStyle(slot, style)
         return slot
     }
 
-    private fun listColumn(block: PaywallBlock.ListBlock): View {
+    private fun listColumn(block: PaywallBlock.ListBlock, style: BlockStyle?): View {
         val column = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-        val gap = dp(block.style?.gap ?: 8.0)
+        val gap = dp(style?.gap ?: 8.0)
         val iconColor = revnixBlockColor(block.iconColor, doc)
             ?: revnixBlockColor(doc.accent, doc)
             ?: Color.WHITE
@@ -388,7 +496,7 @@ internal class PaywallBlockRenderer(
                 ).apply { if (index > 0) topMargin = gap },
             )
         }
-        applyStyle(column, block.style)
+        applyStyle(column, style)
         return column
     }
 
@@ -407,42 +515,80 @@ internal class PaywallBlockRenderer(
         view.setOnClickListener { onClose() }
     }
 
-    private fun buttonView(block: PaywallBlock.Button, pkg: BlockPackage?): View {
+    /**
+     * A button: the label centred over the fill, dimmed to 80% while pressed.
+     * A purchase button under the host's `loading` flag keeps its size and
+     * fill, hides its label, centres a spinner in the accent ink and ignores
+     * taps. Close buttons ignore `loading` — the customer can always leave.
+     */
+    private fun buttonView(block: PaywallBlock.Button, style: BlockStyle?, pkg: BlockPackage?): View {
         val accent = revnixBlockColor(doc.accent, doc) ?: Color.BLUE
         val ink = revnixBlockColor(doc.accentInk, doc) ?: Color.WHITE
         // A button the design marks as the close dismisses instead of buying,
         // and takes no accent fill: the CTA must stay the one accented thing
         // on the screen, or a "Not now" competes with "Subscribe" for the eye.
         val closes = block.action == BlockAction.Close && ctx.onClose != null
-        val label = textView(revnixResolveTags(block.label, pkg, ctx.packages), block.style)
+        val busy = ctx.loading && !closes
+
+        val label = textView(revnixResolveTags(block.label, pkg, ctx.packages), style)
+        // The box half of the style belongs to the button, not its label.
+        label.background = null
+        label.setPadding(0, 0, 0, 0)
+        label.alpha = 1f
+        label.rotation = 0f
         label.gravity = Gravity.CENTER
         label.setTextColor(
-            revnixBlockStrokeColor(block.style?.textColor, doc, ctx.onDiagnostic)
+            revnixBlockStrokeColor(style?.textColor, doc, ctx.onDiagnostic)
                 ?: if (closes) (revnixBlockColor(doc.textColor, doc) ?: Color.WHITE) else ink,
         )
         label.typeface = Typeface.DEFAULT_BOLD
-        // `skipBackground` hands the box back to us, so the fill is resolved
-        // here rather than by `applyStyle` — which is why a gradient CTA used
-        // to flatten to the plain accent.
-        val fill = revnixBlockFill(block.style?.fill, doc, ctx.onDiagnostic)
-        val corner = dp(block.style?.radius ?: 12.0).toFloat()
-        label.background = if (fill.gradients.isEmpty()) {
+
+        val button = PressableFrame(context)
+        // The fill is resolved here rather than by `applyStyle` — which is
+        // why a gradient CTA used to flatten to the plain accent.
+        val fill = revnixBlockFill(style?.fill, doc, ctx.onDiagnostic)
+        val corner = dp(style?.radius ?: 12.0).toFloat()
+        button.background = if (fill.gradients.isEmpty()) {
             GradientDrawable().apply {
                 // The dashboard hands every button's `fill` to CSS
                 // `background`; the close-button rule only decides what happens
                 // when the design set NO fill of its own.
                 val fallback =
-                    if (closes || block.style?.fill != null) Color.TRANSPARENT else accent
+                    if (closes || style?.fill != null) Color.TRANSPARENT else accent
                 setColor(fill.color ?: fallback)
                 cornerRadius = corner
             }
         } else {
             RevnixGradientDrawable(fill.gradients, cornerRadius = corner)
         }
-        val vertical = if (block.style?.height != null) 0 else dp(15.0)
-        label.setPadding(dp(16.0), vertical, dp(16.0), vertical)
-        label.isClickable = true
-        label.setOnClickListener {
+        applyStyle(button, style, skipBackground = true)
+        if (!hasPadding(style)) {
+            val vertical = if (style?.height != null) 0 else dp(15.0)
+            button.setPadding(dp(16.0), vertical, dp(16.0), vertical)
+        }
+        button.baseAlpha = button.alpha
+        button.addView(
+            label,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER,
+            ),
+        )
+
+        if (busy) {
+            // INVISIBLE, not GONE, so the button keeps the label's height.
+            label.visibility = View.INVISIBLE
+            val spinner = ProgressBar(context).apply {
+                isIndeterminate = true
+                indeterminateTintList = ColorStateList.valueOf(ink)
+            }
+            button.addView(spinner, FrameLayout.LayoutParams(dp(20.0), dp(20.0), Gravity.CENTER))
+            button.isClickable = false
+            button.isEnabled = false
+            return button
+        }
+
+        button.isClickable = true
+        button.setOnClickListener {
             if (closes) {
                 ctx.onClose?.invoke()
             } else {
@@ -450,10 +596,16 @@ internal class PaywallBlockRenderer(
                 if (id != null) ctx.onPurchase(id)
             }
         }
-        return label
+        return button
     }
 
-    private fun linksRow(block: PaywallBlock.Links): View? {
+    private fun hasPadding(style: BlockStyle?): Boolean = style != null && (
+        style.padding != null || style.paddingX != null || style.paddingY != null ||
+            style.paddingTop != null || style.paddingRight != null ||
+            style.paddingBottom != null || style.paddingLeft != null
+        )
+
+    private fun linksRow(block: PaywallBlock.Links, style: BlockStyle?): View? {
         // An explicit host handler wins over the config URL — the app knows
         // best how to open its own legal pages; the URL is the fallback.
         val entries = buildList {
@@ -474,7 +626,7 @@ internal class PaywallBlockRenderer(
         }
         for ((index, entry) in entries.withIndex()) {
             val (label, action) = entry
-            val view = textView(label, block.style, defaultSizeSp = 12f)
+            val view = textView(label, style, defaultSizeSp = 12f)
             view.alpha = 0.65f
             view.isClickable = true
             view.setOnClickListener { action() }
@@ -485,7 +637,7 @@ internal class PaywallBlockRenderer(
                 ).apply { if (index > 0) marginStart = dp(20.0) },
             )
         }
-        applyStyle(row, block.style, skipBackground = true)
+        applyStyle(row, style, skipBackground = true)
         return row
     }
 
@@ -502,7 +654,7 @@ internal class PaywallBlockRenderer(
         }
     }
 
-    private fun productsColumn(block: PaywallBlock.Products): View {
+    private fun productsColumn(block: PaywallBlock.Products, style: BlockStyle?): View {
         val shown = ctx.packages
         val highlightId = ctx.selectedPackageId?.takeIf { id -> shown.any { it.packageId == id } }
             ?: shown.firstOrNull()?.packageId
@@ -510,7 +662,7 @@ internal class PaywallBlockRenderer(
         val container = LinearLayout(context).apply {
             orientation = if (row) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
         }
-        val gap = dp(block.style?.gap ?: 8.0)
+        val gap = dp(style?.gap ?: 8.0)
         val accent = revnixBlockColor(doc.accent, doc) ?: Color.BLUE
 
         for ((index, pkg) in shown.withIndex()) {
@@ -556,6 +708,7 @@ internal class PaywallBlockRenderer(
             applyStyle(card, if (highlighted) block.highlightStyle else block.cardStyle)
             // The whole card is the target, not just its glyphs — a plan row
             // is mostly padding, and tapping beside the price must select.
+            // No pressed dimming: the highlight IS the feedback.
             card.setOnClickListener { ctx.onSelect(pkg.packageId) }
 
             val params = if (row) {
@@ -570,7 +723,7 @@ internal class PaywallBlockRenderer(
             }
             container.addView(card, params)
         }
-        applyStyle(container, block.style, skipBackground = true)
+        applyStyle(container, style, skipBackground = true)
         return container
     }
 
@@ -587,57 +740,52 @@ internal class PaywallBlockRenderer(
     // ——— containers ———
 
     /**
+     * A card, in the context it establishes.
+     *
+     * A `repeat` card draws once per package, each instance in its own
+     * package's context. A pinned card (`packageIndex`) starts a context from
+     * its package; any other card inherits its parent's. Both kinds of
+     * package card double as their package's selection target — that is how
+     * hand-styled plan rows become tappable without a products block — and
+     * everything inside them, not only the card itself, takes `selectedStyle`
+     * and honours `visibility` against that package (REV-262).
+     */
+    private fun card(block: PaywallBlock.Card, parent: BlockSelectionContext): Drawn? {
+        if (block.repeat == "packages") {
+            // With nothing attached a single instance still draws, so the
+            // design stays visible.
+            val list: List<BlockPackage?> = ctx.packages.ifEmpty { listOf(null) }
+            val wrapper = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            for (each in list) {
+                val sc = revnixPackageContext(each, ctx.selectedPackageId)
+                if (!revnixIsBlockVisible(block, sc)) continue
+                wrapper.addView(container(block, sc, revnixEffectiveStyle(block, sc), selects = each?.packageId))
+            }
+            return Drawn(wrapper, block.style)
+        }
+
+        // A card that names a package the offering does not reach is dropped
+        // rather than drawn with unresolved tags.
+        val sc = revnixCardContext(block, parent, ctx.packages, ctx.selectedPackageId) ?: return null
+        if (!revnixIsBlockVisible(block, sc)) return null
+        val style = revnixEffectiveStyle(block, sc)
+        val selects = if (block.packageIndex != null) sc.pkg?.packageId else null
+        return Drawn(container(block, sc, style, selects), style)
+    }
+
+    /**
      * The container. `layout` maps onto the platform's own primitives: column
      * → LinearLayout(VERTICAL), row → LinearLayout(HORIZONTAL), stack →
      * FrameLayout, grid → GridLayout. Any value this SDK does not know falls
      * back to a column rather than drawing nothing.
      */
-    private fun card(block: PaywallBlock.Card, pkg: BlockPackage?): View? {
-        if (block.repeat == "packages") {
-            // One designed card, drawn per package. With nothing attached a
-            // single instance still draws, so the design stays visible.
-            val list: List<BlockPackage?> = ctx.packages.ifEmpty { listOf(null) }
-            val wrapper = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-            val selected = ctx.selectedPackageId ?: ctx.packages.firstOrNull()?.packageId
-            for (each in list) {
-                val style = if (each != null && each.packageId == selected) {
-                    (block.style ?: BlockStyle()).merging(block.selectedStyle)
-                } else {
-                    block.style
-                }
-                wrapper.addView(container(block, each, style, selects = each?.packageId))
-            }
-            return wrapper
-        }
-
-        // A card that names a package the offering does not reach is dropped
-        // rather than drawn with unresolved tags.
-        val index = block.packageIndex
-        if (index != null && index >= ctx.packages.size) return null
-        val pinned = index?.let { ctx.packages.getOrNull(it) }
-        val ctxPackage = pinned ?: pkg
-        // A card pinned to a package doubles as its selection target — that is
-        // how hand-styled plan rows (a highlighted annual beside a plain
-        // monthly) become tappable without a products block. It takes
-        // `selectedStyle` when selected for the same reason a repeated card
-        // does, or tapping it would change what the CTA buys with no visible
-        // answer. A card that names no package is decoration and stays inert.
-        val selected = ctx.selectedPackageId ?: ctx.packages.firstOrNull()?.packageId
-        val style = if (pinned != null && pinned.packageId == selected) {
-            (block.style ?: BlockStyle()).merging(block.selectedStyle)
-        } else {
-            block.style
-        }
-        return container(block, ctxPackage, style, selects = pinned?.packageId)
-    }
-
     private fun container(
         block: PaywallBlock.Card,
-        pkg: BlockPackage?,
+        sc: BlockSelectionContext,
         style: BlockStyle?,
         selects: String? = null,
     ): View {
-        val gap = dp(block.style?.gap ?: 10.0)
+        val gap = dp(style?.gap ?: 10.0)
         val children = block.children
 
         val group: ViewGroup = when (block.layout) {
@@ -648,30 +796,35 @@ internal class PaywallBlockRenderer(
             }
             "row" -> LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = rowGravity(block.style)
+                gravity = rowGravity(style)
             }
             // column, and anything unrecognized.
             else -> LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = columnGravity(block.style)
+                gravity = columnGravity(style)
             }
         }
 
-        for ((index, child) in children.withIndex()) {
-            val view = render(child, pkg) ?: continue
+        // Counts DRAWN children, so a hidden first child never leaves the
+        // gap it would have carried.
+        var placed = 0
+        for (child in children) {
+            val drawn = render(child, sc) ?: continue
             when (group) {
-                is FrameLayout -> group.addView(view, stackParams(child.style))
+                is FrameLayout -> group.addView(drawn.view, stackParams(drawn.style))
                 is GridLayout -> group.addView(
-                    view,
+                    drawn.view,
                     GridLayout.LayoutParams().apply {
                         width = 0
                         height = ViewGroup.LayoutParams.WRAP_CONTENT
                         columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
-                        setMargins(0, if (index >= gridColumnCount(block)) gap else 0, 0, 0)
+                        setMargins(0, if (placed >= gridColumnCount(block)) gap else 0, 0, 0)
+                        applyMargins(this, drawn.style)
                     },
                 )
-                else -> group.addView(view, lineParams(child, index, gap, block.layout == "row"))
+                else -> group.addView(drawn.view, lineParams(child, drawn.style, placed, gap, block.layout == "row"))
             }
+            placed++
         }
         applyStyle(group, style)
         if (selects != null) group.setOnClickListener { ctx.onSelect(selects) }
@@ -687,15 +840,19 @@ internal class PaywallBlockRenderer(
     /** flex-grow, flex-shrink and the gap, as LinearLayout understands them. */
     private fun lineParams(
         child: PaywallBlock,
+        style: BlockStyle?,
         index: Int,
         gap: Int,
         horizontal: Boolean,
     ): LinearLayout.LayoutParams {
-        val style = child.style
-        val grow = style?.flex ?: 0.0
+        // A flex spacer grows like a `flex: 1` box, whatever its style says.
+        val grow = if (child is PaywallBlock.Spacer && child.flex == true) 1.0 else style?.flex ?: 0.0
         val basis = style?.basis?.let { dp(it) }
         val explicit = style?.width?.px?.let { dp(it) }
         val height = style?.height?.px?.let { dp(it) }
+        // `height: "100%"` on a root card of a canvas design is what makes it
+        // follow a taller viewport instead of leaving a band.
+        val fullHeight = style?.height?.fraction == 1.0
 
         val params = if (horizontal) {
             LinearLayout.LayoutParams(
@@ -705,12 +862,17 @@ internal class PaywallBlockRenderer(
                     explicit != null -> explicit
                     else -> ViewGroup.LayoutParams.WRAP_CONTENT
                 },
-                height ?: ViewGroup.LayoutParams.WRAP_CONTENT,
+                height ?: if (fullHeight) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT,
             )
         } else {
             LinearLayout.LayoutParams(
                 explicit ?: ViewGroup.LayoutParams.MATCH_PARENT,
-                if (grow > 0) 0 else height ?: ViewGroup.LayoutParams.WRAP_CONTENT,
+                when {
+                    grow > 0 -> 0
+                    height != null -> height
+                    fullHeight -> ViewGroup.LayoutParams.MATCH_PARENT
+                    else -> ViewGroup.LayoutParams.WRAP_CONTENT
+                },
             )
         }
         if (grow > 0) params.weight = grow.toFloat()
@@ -721,6 +883,7 @@ internal class PaywallBlockRenderer(
             if (horizontal) params.marginStart = gap else params.topMargin = gap
         }
         style?.selfAlign?.let { params.gravity = alignToGravity(it, horizontal) }
+        applyMargins(params, style)
         return params
     }
 
@@ -732,8 +895,10 @@ internal class PaywallBlockRenderer(
             )
         }
         val params = FrameLayout.LayoutParams(
-            style?.width?.px?.let { dp(it) } ?: ViewGroup.LayoutParams.WRAP_CONTENT,
-            style?.height?.px?.let { dp(it) } ?: ViewGroup.LayoutParams.WRAP_CONTENT,
+            style?.width?.px?.let { dp(it) }
+                ?: if (style?.width?.fraction == 1.0) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT,
+            style?.height?.px?.let { dp(it) }
+                ?: if (style?.height?.fraction == 1.0) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT,
         )
         var gravity = 0
         style?.top?.px?.let { params.topMargin = dp(it); gravity = gravity or Gravity.TOP }
@@ -746,7 +911,25 @@ internal class PaywallBlockRenderer(
             gravity = gravity or Gravity.CENTER_HORIZONTAL
         }
         if (gravity != 0) params.gravity = gravity
+        applyMargins(params, style)
         return params
+    }
+
+    /**
+     * The design's own margins, on top of whatever gap or offset the parent
+     * already placed. Lives on the params, which is the only place a margin
+     * means anything.
+     */
+    private fun applyMargins(params: ViewGroup.MarginLayoutParams, style: BlockStyle?) {
+        if (style == null) return
+        style.margin?.let {
+            val m = dp(it)
+            params.setMargins(m, m, m, m)
+        }
+        style.marginTop?.px?.let { params.topMargin = dp(it) }
+        style.marginBottom?.px?.let { params.bottomMargin = dp(it) }
+        style.marginLeft?.px?.let { params.marginStart = dp(it) }
+        style.marginRight?.px?.let { params.marginEnd = dp(it) }
     }
 
     private fun rowGravity(style: BlockStyle?): Int {
@@ -792,7 +975,8 @@ internal class PaywallBlockRenderer(
      *
      * Every field is read independently and only when present, which is what
      * lets a design authored against a newer dashboard draw here minus the one
-     * effect this SDK does not know, rather than failing.
+     * effect this SDK does not know, rather than failing. Margins are the
+     * parent's business — see [applyMargins].
      */
     private fun applyStyle(view: View, style: BlockStyle?, skipBackground: Boolean = false) {
         if (style == null) return
@@ -847,21 +1031,6 @@ internal class PaywallBlockRenderer(
         style.rotate?.let { view.rotation = it.toFloat() }
         style.minHeight?.let { view.minimumHeight = dp(it) }
         style.zIndex?.let { view.elevation = it.toFloat() }
-
-        // Margins are only meaningful once the view is in a parent that
-        // understands them; the layout params the caller built already carry
-        // the gap, so this only adds what the design asked for on top.
-        val params = view.layoutParams as? ViewGroup.MarginLayoutParams
-        if (params != null) {
-            style.marginTop?.px?.let { params.topMargin = dp(it) }
-            style.marginBottom?.px?.let { params.bottomMargin = dp(it) }
-            style.marginLeft?.px?.let { params.marginStart = dp(it) }
-            style.marginRight?.px?.let { params.marginEnd = dp(it) }
-            style.margin?.let {
-                val m = dp(it)
-                params.setMargins(m, m, m, m)
-            }
-        }
     }
 
     private fun withAlpha(color: Int, alpha: Double): Int =
@@ -869,4 +1038,157 @@ internal class PaywallBlockRenderer(
             (Color.alpha(color) * alpha).roundToInt().coerceIn(0, 255),
             Color.red(color), Color.green(color), Color.blue(color),
         )
+
+    private companion object {
+        /** The widest a canvas design scales to, in dp — the tablet/landscape rule. */
+        const val CANVAS_MAX_WIDTH = 480.0
+
+        /** The fallback close chip's distance from the top and trailing edges, in dp. */
+        const val CLOSE_INSET = 14.0
+    }
+}
+
+// ——— canvas plumbing ———
+
+/**
+ * Lays the canvas body out at its authored width, scales it uniformly to
+ * the viewport and reports the SCALED size — a plain `scaleX` leaves the
+ * layout size untouched, which is what clipped short screens and left a
+ * band under tall ones. The body's height in design units grows to fill the
+ * viewport, so bottom-anchored groups and `height: 100%` roots follow.
+ */
+private class CanvasStage(
+    context: Context,
+    private val body: View,
+    private val canvasWidth: Int,
+    private val minHeight: Int,
+    private val maxWidth: Int,
+) : ViewGroup(context) {
+
+    /** The scroll container's inner height, set by [CanvasScroll] before measuring. */
+    var viewportHeight: Int = 0
+
+    private var scale = 1f
+    private var designHeight = minHeight
+
+    init {
+        clipChildren = false
+        addView(body)
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val width = MeasureSpec.getSize(widthMeasureSpec)
+        scale = if (width > 0 && canvasWidth > 0) min(width, maxWidth).toFloat() / canvasWidth else 1f
+        val viewport = if (viewportHeight > 0) viewportHeight else MeasureSpec.getSize(heightMeasureSpec)
+        designHeight = max(minHeight, ceil(viewport / scale).toInt())
+        body.measure(
+            MeasureSpec.makeMeasureSpec(canvasWidth, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(designHeight, MeasureSpec.EXACTLY),
+        )
+        setMeasuredDimension(width, ceil(designHeight * scale).toInt())
+    }
+
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        // Centred: the layout rect is unscaled, so the offset is computed
+        // from the scaled width and the transform grows from the top-left.
+        val left = (((r - l) - canvasWidth * scale) / 2f).roundToInt()
+        body.layout(left, 0, left + canvasWidth, designHeight)
+        body.pivotX = 0f
+        body.pivotY = 0f
+        body.scaleX = scale
+        body.scaleY = scale
+    }
+}
+
+/** A ScrollView that tells its [CanvasStage] how tall the viewport is. */
+private class CanvasScroll(context: Context) : ScrollView(context) {
+    var stage: CanvasStage? = null
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        stage?.viewportHeight = (MeasureSpec.getSize(heightMeasureSpec) - paddingTop - paddingBottom).coerceAtLeast(0)
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+}
+
+/**
+ * The screen root. Window insets are only dispatched when they change, and
+ * a designed paywall rebuilds its screen on every selection — so each new
+ * root asks for them as it attaches, or the close chip would sit under the
+ * status bar until the next rotation.
+ */
+private class InsetRequestingFrame(context: Context) : FrameLayout(context) {
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        requestApplyInsets()
+    }
+}
+
+/** A box that keeps the design's aspect ratio when nothing fixes its height. */
+private class AspectFrame(context: Context, private val ratio: Double) : FrameLayout(context) {
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val width = MeasureSpec.getSize(widthMeasureSpec)
+        if (MeasureSpec.getMode(heightMeasureSpec) != MeasureSpec.EXACTLY && width > 0 && ratio > 0) {
+            val height = (width / ratio).roundToInt()
+            super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY))
+        } else {
+            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+        }
+    }
+}
+
+/** A button box that draws at 80% while the finger is down. */
+private class PressableFrame(context: Context) : FrameLayout(context) {
+    /** The alpha the design asked for; pressed dims relative to it. */
+    var baseAlpha: Float = 1f
+        set(value) {
+            field = value
+            alpha = value
+        }
+
+    override fun setPressed(pressed: Boolean) {
+        super.setPressed(pressed)
+        alpha = if (pressed) baseAlpha * PRESSED_ALPHA else baseAlpha
+    }
+
+    private companion object {
+        const val PRESSED_ALPHA = 0.8f
+    }
+}
+
+/**
+ * An image block's photo. It asks the loader for a decode sized to its own
+ * box once it has one (falling back to the display size while it is still
+ * unsized), and takes a cached bitmap straight away on attach — which is
+ * what keeps a selection rebuild from flashing every photo on the screen.
+ */
+private class RevnixBlockImageView(
+    context: Context,
+    private val url: String,
+    private val onLoaded: () -> Unit,
+) : ImageView(context) {
+
+    private var requested = false
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        RevnixImageLoader.cached(url)?.let { show(it) }
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (drawable != null || requested || (w <= 0 && h <= 0)) return
+        requested = true
+        val metrics = resources.displayMetrics
+        RevnixImageLoader.load(
+            url,
+            if (w > 0) w else metrics.widthPixels,
+            if (h > 0) h else metrics.heightPixels,
+        ) { show(it) }
+    }
+
+    private fun show(bitmap: Bitmap) {
+        if (drawable != null) return
+        setImageBitmap(bitmap)
+        onLoaded()
+    }
 }

@@ -9,7 +9,6 @@ package com.revnix.android.ui
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.LinearGradient
@@ -28,8 +27,6 @@ import android.widget.ImageView
 import com.revnix.RevnixBackgroundFit
 import com.revnix.RevnixBackgroundImage
 import com.revnix.RevnixGradient
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.math.max
 
 /**
@@ -131,18 +128,16 @@ internal class RevnixGradientDrawable(
 /**
  * The background photo as a view.
  *
- * Image loading is otherwise the host app's job in this SDK — it ships no
- * image library — but a background the designer chose is not optional
- * decoration, so the same plain HttpURLConnection + BitmapFactory fetch the
- * legacy paywall uses for its hero is reused here. A failed load leaves the
- * ground and scrim in place rather than blacking out the screen.
+ * Fetched through [RevnixImageLoader] — the same loader `image` blocks use —
+ * which also caches the decoded bitmap by URL, so the structural rebuild a
+ * plan-card tap triggers finds the photo already decoded instead of
+ * downloading it again. A failed load leaves the ground and scrim in place
+ * rather than blacking out the screen.
  */
 internal class RevnixBackgroundPhotoView(
     context: Context,
     private val spec: RevnixBackgroundImage,
 ) : ImageView(context) {
-
-    private var thread: Thread? = null
 
     init {
         scaleType = if (spec.fit == RevnixBackgroundFit.CONTAIN) {
@@ -175,34 +170,15 @@ internal class RevnixBackgroundPhotoView(
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        if (drawable != null || thread != null) return
-        val url = spec.url
-        thread = Thread {
-            val bitmap = runCatching {
-                val connection = URL(url).openConnection() as HttpURLConnection
-                connection.connectTimeout = 10_000
-                connection.readTimeout = 10_000
-                try {
-                    if (connection.responseCode in 200..299) {
-                        connection.inputStream.use { BitmapFactory.decodeStream(it) }
-                    } else {
-                        null
-                    }
-                } finally {
-                    connection.disconnect()
-                }
-            }.getOrNull()
-            if (bitmap != null) post { apply(bitmap) }
-        }.also { it.isDaemon = true; it.start() }
-    }
-
-    override fun onDetachedFromWindow() {
-        thread?.interrupt()
-        thread = null
-        super.onDetachedFromWindow()
+        if (drawable != null) return
+        // The background always fills the viewport, so the display is the
+        // box to decode for — the view's own size is not known yet here.
+        val metrics = resources.displayMetrics
+        RevnixImageLoader.load(spec.url, metrics.widthPixels, metrics.heightPixels) { apply(it) }
     }
 
     private fun apply(bitmap: Bitmap) {
+        if (drawable != null) return
         setImageBitmap(bitmap)
         placeCover()
     }

@@ -52,6 +52,7 @@ import com.revnix.PaywallConfig
 import com.revnix.RevnixClient
 import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBlockColor
+import com.revnix.revnixSelectedPackageId
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.roundToInt
@@ -233,12 +234,19 @@ public class RevnixPaywallView @JvmOverloads constructor(
 
     /**
      * Renders a spinner in the CTA and blocks purchasing while true — the RN
-     * `loading` prop. Only the CTA re-renders; scroll position and selection
-     * are untouched.
+     * `loading` prop. On a classic layout only the CTA re-renders; scroll
+     * position and selection are untouched. A designed paywall redraws, the
+     * way it does for selection: its buttons are built from the tree, and
+     * the flag is part of what they are built from (REV-262).
      */
     public var loading: Boolean = false
         set(value) {
+            val changed = field != value
             field = value
+            if (blockPaywall) {
+                if (changed) render()
+                return
+            }
             ctaLabelView?.visibility = if (value) INVISIBLE else VISIBLE
             ctaSpinner?.visibility = if (value) VISIBLE else GONE
         }
@@ -1449,7 +1457,6 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private fun renderBlocks(blockDoc: PaywallBlockDoc, config: PaywallConfig): Boolean {
         val shown = packages
         shownPackages = shown
-        val selected = selectedPackageIdOrDefault(config, shown)
         val blockPackages = shown.map {
             BlockPackage(
                 packageId = it.packageId,
@@ -1460,6 +1467,13 @@ public class RevnixPaywallView @JvmOverloads constructor(
                 currency = it.currency,
             )
         }
+        // The package the design emphasizes, and the one copy outside a plan
+        // card resolves against: the host's controlled selection, then the
+        // internal one, then the config's highlight, then the first package
+        // — the contract's rule, shared with every renderer (REV-262).
+        val selected = revnixSelectedPackageId(
+            blockPackages, selectedPackageId, internalSelected, config.highlightPackageId,
+        )
         val screen = runCatching {
             PaywallBlockRenderer(
                 context,
@@ -1476,6 +1490,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     onTerms = onTerms,
                     onPrivacy = onPrivacy,
                     onClose = onClose?.let { { closeAndReport() } },
+                    loading = loading,
                     onDiagnostic = diagnosticClient?.let { c -> { m: String -> c.reportRenderDiagnostic(m) } },
                 ),
             ).renderScreen()
@@ -1494,23 +1509,6 @@ public class RevnixPaywallView @JvmOverloads constructor(
         // paths go through — a designed paywall reports exactly like a
         // classic one, and neither path can double-count.
         return true
-    }
-
-    /**
-     * The package the design emphasizes: the host's controlled selection, then
-     * the internal one, then the config's highlight, then the first package.
-     */
-    private fun selectedPackageIdOrDefault(
-        config: PaywallConfig,
-        shown: List<RevnixPaywallPackage>,
-    ): String? {
-        val controlled = selectedPackageId
-        if (controlled != null && shown.any { it.packageId == controlled }) return controlled
-        val internal = internalSelected
-        if (internal != null && shown.any { it.packageId == internal }) return internal
-        val highlight = config.highlightPackageId
-        if (highlight != null && shown.any { it.packageId == highlight }) return highlight
-        return shown.firstOrNull()?.packageId
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).roundToInt()
