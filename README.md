@@ -1,6 +1,6 @@
 # Revnix Kotlin SDK
 
-Native Android SDK for [Revnix](https://revnix.com), Play Billing 8 purchase
+Native Android SDK for [Revnix](https://revnix.io), Play Billing 8 purchase
 glue plus the same resilience policy as `revnix-react` and `revnix-swift`.
 
 - **Play Billing 8 native**, with auto-reconnect and the acknowledgement rule
@@ -143,6 +143,39 @@ classic structure), `mode` picks the dark/light palette, and a
 Terms/Privacy links prefer your `onTerms`/`onPrivacy` handlers and fall back
 to opening the config's URLs.
 
+### Reporting a display you render yourself
+
+`RevnixPaywallView` reports all of the below for you. Rendering your own
+paywall, the three calls are yours:
+
+| Call | What it does |
+|---|---|
+| `logPaywallDisplay(placementKey, paywallId): String` | The impression beacon, returning the `viewId` it minted. Prefer it over `logPaywallShown` whenever you intend to report the close or an interaction — that id is what pairs the halves of one display. |
+| `logPaywallClosed(viewId, placementKey, paywallId)` | Ends that display. Idempotent per view id, so a retry, a rotation or a double-dismiss cannot count two. Without it a funnel knows how many saw the paywall, not how many left without buying. |
+| `logPaywallEvent(event, viewId, …)` | One of six interactions — `Selected`, `PurchaseStarted`, `PurchaseAbandoned`, `PurchaseFailed`, `Restore`, `Error` — i.e. what happened BETWEEN the display and the close. |
+
+The purchase **outcome** is always yours, even with the built-in renderer:
+your app makes the Play Billing call, so only your app sees whether the sheet
+was cancelled or the card was declined.
+
+```kotlin
+val viewId = client.logPaywallDisplay(placementKey, paywall.paywallId)
+
+when (result.responseCode) {
+    BillingResponseCode.USER_CANCELED ->
+        client.logPaywallEvent(RevnixPaywallEvent.PurchaseAbandoned, viewId, productId = productId)
+    BillingResponseCode.OK -> Unit
+    else ->
+        client.logPaywallEvent(RevnixPaywallEvent.PurchaseFailed, viewId, productId = productId)
+}
+
+client.logPaywallClosed(viewId, placementKey, paywall.paywallId)
+```
+
+All of these are fire-and-forget: failures go to `onDiagnostic`, never to your
+call site, and all are pure ledger history — over-reporting can skew a report,
+never grant or revoke access.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
@@ -210,5 +243,5 @@ purchases in a sandbox app, not by either suite.
 **Not yet published.** `com.revnix:revnix-android:0.2.0` is the intended
 coordinate, but nothing is on Maven Central yet, so that dependency will not
 resolve. Until it ships, apps integrate over the
-[REST API](https://revnix.com/docs/android), the same `/v1` contract this SDK
+[REST API](https://revnix.io/docs/android), the same `/v1` contract this SDK
 speaks, so migrating later does not change the backend integration.
