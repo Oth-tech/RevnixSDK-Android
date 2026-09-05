@@ -37,6 +37,7 @@ import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Outline
+import android.graphics.Path
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
@@ -61,6 +62,9 @@ import com.revnix.BlockSelectionContext
 import com.revnix.BlockStyle
 import com.revnix.PaywallBlock
 import com.revnix.PaywallBlockDoc
+import com.revnix.revnixIsConvex
+import com.revnix.revnixParsePolygon
+import com.revnix.revnixParseTranslate
 import com.revnix.RevnixBackgroundLayers
 import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBackgroundLayers
@@ -1031,6 +1035,77 @@ internal class PaywallBlockRenderer(
         style.rotate?.let { view.rotation = it.toFloat() }
         style.minHeight?.let { view.minimumHeight = dp(it) }
         style.zIndex?.let { view.elevation = it.toFloat() }
+        applyTranslate(view, style.translate)
+        applyClipPath(view, style, ctx.onDiagnostic)
+    }
+
+    /**
+     * CSS `translate`, resolved against the block's OWN size.
+     *
+     * `translationX/Y` moves the drawn view without moving its layout slot,
+     * which is exactly what CSS `translate` does — so `left: 50%` pins the
+     * badge's edge and this pulls it back by half its own width to centre it.
+     *
+     * A percentage needs the view measured, so that case re-applies on every
+     * layout pass; a points-only translate is set once and costs nothing.
+     */
+    private fun applyTranslate(view: View, css: String?) {
+        val translate = revnixParseTranslate(css) ?: return
+        if (translate.isAbsolute) {
+            view.translationX = dp(translate.x.px).toFloat()
+            view.translationY = dp(translate.y.px).toFloat()
+            return
+        }
+        fun apply() {
+            view.translationX = translate.x.resolvedAgainst(view.width.toDouble()).toFloat()
+            view.translationY = translate.y.resolvedAgainst(view.height.toDouble()).toFloat()
+        }
+        // A percentage of a view that has not been measured yet is a
+        // percentage of zero, so the offset is re-applied whenever the size
+        // it depends on changes — a rotation, a font scale, a wider screen.
+        view.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> apply() }
+        if (view.width > 0 || view.height > 0) apply()
+    }
+
+    /**
+     * A polygon `clipPath` — starbursts, ticket notches, chevron rails.
+     *
+     * Android clips a view to a path through [android.graphics.Outline], which
+     * the platform only honours for a CONVEX path. Four of the five shapes the
+     * shipped library uses are convex and clip exactly; the 32-point starburst
+     * is not, and is reported rather than drawn as a rectangle pretending to
+     * be a star. Either way the block keeps its content — an unclipped block
+     * shows too much, never too little.
+     */
+    private fun applyClipPath(view: View, style: BlockStyle, onDiagnostic: ((String) -> Unit)?) {
+        val spec = style.clipPath?.takeIf { it.isNotEmpty() } ?: return
+        val points = revnixParsePolygon(spec)
+        // The nominal check decides what to REPORT, before any size exists.
+        if (points == null || !points.revnixIsConvex()) {
+            onDiagnostic?.invoke("clipPath not drawn: $spec")
+            return
+        }
+        view.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(v: View, outline: Outline) {
+                val w = v.width.toDouble()
+                val h = v.height.toDouble()
+                if (w <= 0.0 || h <= 0.0) return
+                // Re-checked at the REAL size: a shape convex at the nominal
+                // box can turn concave once a calc() term meets an actual
+                // width, and Outline silently declines to clip a concave path
+                // — leaving the block unclipped rather than mis-clipped.
+                if (!points.revnixIsConvex(w, h)) return
+                val path = Path()
+                points.forEachIndexed { i, p ->
+                    val x = p.x.resolvedAgainst(w).toFloat()
+                    val y = p.y.resolvedAgainst(h).toFloat()
+                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                path.close()
+                outline.setPath(path)
+            }
+        }
+        view.clipToOutline = true
     }
 
     private fun withAlpha(color: Int, alpha: Double): Int =

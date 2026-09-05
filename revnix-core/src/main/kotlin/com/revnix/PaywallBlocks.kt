@@ -92,6 +92,12 @@ public data class BlockDimension(
  */
 public data class BlockStyle(
     public val fill: String? = null,
+    /**
+     * Sizing for a `fill` that is an image or a REPEATING gradient — the CSS
+     * `background-size` value ("cover", "24px 24px"). The grid and hatch
+     * washes several designs use are a tiled gradient.
+     */
+    public val fillSize: String? = null,
     public val textColor: String? = null,
     /** 0–100, like the dashboard's opacity inputs. */
     public val opacity: Double? = null,
@@ -130,6 +136,14 @@ public data class BlockStyle(
     public val lineHeight: Double? = null,
     public val textTransform: String? = null,
     public val decoration: String? = null,
+    /**
+     * Line-breaking preference for headlines ("balance", "pretty").
+     *
+     * Decoded and merged so the field survives a round trip. Compose has no
+     * balanced-wrap strategy, so it does not change layout here: it decides
+     * where a ragged edge falls, not what the design says.
+     */
+    public val textWrap: String? = null,
     public val nowrap: Boolean? = null,
     /** Gap between a container's children. */
     public val gap: Double? = null,
@@ -151,7 +165,18 @@ public data class BlockStyle(
     public val selfAlign: String? = null,
     public val shadow: String? = null,
     public val blur: Double? = null,
+    /**
+     * Raw CSS clip-path — starbursts and ticket notches. Only the
+     * `polygon(...)` form the designs use is drawn.
+     */
+    public val clipPath: String? = null,
     public val rotate: Double? = null,
+    /**
+     * CSS `translate` value ("-50% 0") — the designs centre pinned badges
+     * with left:50% + translateX(-50%). Resolved against the block's OWN
+     * size, so a percentage means what CSS means by it.
+     */
+    public val translate: String? = null,
     /**
      * Placement inside a `stack` container. `inset` fills the stack; the
      * individual offsets pin an edge. Ignored outside a stack.
@@ -172,6 +197,7 @@ public data class BlockStyle(
         if (other == null) return this
         return BlockStyle(
             fill = other.fill ?: fill,
+            fillSize = other.fillSize ?: fillSize,
             textColor = other.textColor ?: textColor,
             opacity = other.opacity ?: opacity,
             borderColor = other.borderColor ?: borderColor,
@@ -202,6 +228,7 @@ public data class BlockStyle(
             lineHeight = other.lineHeight ?: lineHeight,
             textTransform = other.textTransform ?: textTransform,
             decoration = other.decoration ?: decoration,
+            textWrap = other.textWrap ?: textWrap,
             nowrap = other.nowrap ?: nowrap,
             gap = other.gap ?: gap,
             height = other.height ?: height,
@@ -218,7 +245,9 @@ public data class BlockStyle(
             selfAlign = other.selfAlign ?: selfAlign,
             shadow = other.shadow ?: shadow,
             blur = other.blur ?: blur,
+            clipPath = other.clipPath ?: clipPath,
             rotate = other.rotate ?: rotate,
+            translate = other.translate ?: translate,
             inset = other.inset ?: inset,
             top = other.top ?: top,
             right = other.right ?: right,
@@ -237,7 +266,8 @@ public data class BlockStyle(
             fun b(key: String) = o[key]?.booleanOrNullSafe
             fun dim(key: String) = BlockDimension.from(o[key])
             return BlockStyle(
-                fill = s("fill"), textColor = s("textColor"), opacity = d("opacity"),
+                fill = s("fill"), fillSize = s("fillSize"),
+                textColor = s("textColor"), opacity = d("opacity"),
                 borderColor = s("borderColor"), borderWidth = d("borderWidth"),
                 borderTop = s("borderTop"), borderRight = s("borderRight"),
                 borderBottom = s("borderBottom"), borderLeft = s("borderLeft"),
@@ -251,12 +281,14 @@ public data class BlockStyle(
                 fontFamily = s("fontFamily"), fontStyle = s("fontStyle"), align = s("align"),
                 letterSpacing = d("letterSpacing"), lineHeight = d("lineHeight"),
                 textTransform = s("textTransform"), decoration = s("decoration"),
+                textWrap = s("textWrap"),
                 nowrap = b("nowrap"), gap = d("gap"), height = dim("height"),
                 minHeight = d("minHeight"), width = dim("width"), maxWidth = dim("maxWidth"),
                 aspectRatio = dim("aspectRatio"), flex = d("flex"), shrink = d("shrink"),
                 basis = d("basis"), wrap = b("wrap"), justify = s("justify"),
                 items = s("items"), selfAlign = s("selfAlign"), shadow = s("shadow"),
-                blur = d("blur"), rotate = d("rotate"), inset = b("inset"),
+                blur = d("blur"), clipPath = s("clipPath"), rotate = d("rotate"),
+                translate = s("translate"), inset = b("inset"),
                 top = dim("top"), right = dim("right"), bottom = dim("bottom"), left = dim("left"),
                 zIndex = d("zIndex"), overflow = s("overflow"),
             )
