@@ -39,4 +39,13 @@ public data class RevnixConfig(
     val now: () -> Long = { System.currentTimeMillis() },
     /** Injectable HTTP client for tests. */
     val httpClient: OkHttpClient? = null,
+    /**
+     * REV-268: facts about the device, sent with every placement resolve so
+     * targeting rules can be evaluated on the request that serves the paywall,
+     * and stored on the customer as reserved `device.*` attributes. Defaults to
+     * [DeviceFacts.detect]; on Android prefer `AndroidDeviceFacts.detect(context)`
+     * from `revnix-android`, which adds the app version and sandbox flag. Pass
+     * null to send nothing.
+     */
+    val device: DeviceFacts? = DeviceFacts.detect(),
 )

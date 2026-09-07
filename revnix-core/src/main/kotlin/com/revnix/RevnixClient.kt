@@ -63,13 +63,22 @@ public class RevnixClient(private val config: RevnixConfig) {
     private var inflight: Deferred<CustomerEntitlements>? = null
     private var bgFailures = 0
 
+    /**
+     * REV-268: the encoded X-Revnix-Device value, built on the first resolve and
+     * kept for the client's lifetime (so `firstOpen` holds for the whole first
+     * session). Wrapped so "built, and there is nothing to send" is
+     * distinguishable from "not built yet".
+     */
+    private val deviceHeader: String? by lazy { buildDeviceHeader() }
+
     private companion object {
         const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
         const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
         const val CACHE_CUSTOMERS = 4
-        const val SDK_VERSION = "0.2.0"
+        const val SDK_VERSION = "0.3.0"
 
         const val KEY_CUSTOMER_ID = "revnix.customerId"
+        const val KEY_INSTALLED_AT = "revnix.installedAt"
         const val KEY_WALL_CLOCK = "revnix.lastWallClock"
         const val KEY_QUEUE = "revnix.pendingPurchases"
         const val KEY_CACHE_INDEX = "revnix.entIndex"
@@ -304,8 +313,17 @@ public class RevnixClient(private val config: RevnixConfig) {
         // The customer id makes experiment assignment sticky server-side
         // (REV-219); older servers simply ignore the parameter.
         val query = mapOf("customer" to customerId())
+        // REV-268: the device facts ride along so targeting rules see THIS
+        // device on THIS request, and the server stores them as device.*
+        // attributes. Older servers ignore the header.
+        val headers = deviceHeader?.let { mapOf("X-Revnix-Device" to it) }.orEmpty()
         try {
-            val raw = request("GET", listOf("v1", "placements", key, "offering"), query = query)
+            val raw = request(
+                "GET",
+                listOf("v1", "placements", key, "offering"),
+                query = query,
+                headers = headers,
+            )
             val resolution = decode(PlacementResolution.serializer(), raw)
             config.storage.set(placementKey(key), raw)
             return resolution
@@ -315,6 +333,27 @@ public class RevnixClient(private val config: RevnixConfig) {
             return runCatching { decode(PlacementResolution.serializer(), cached) }
                 .getOrElse { throw err }
         }
+    }
+
+    /**
+     * REV-268: assemble the device facts once. `installedAt` is the first launch
+     * this storage ever saw — written then, read back on every later one — and
+     * `firstOpen` is true for the whole of that first session.
+     */
+    private fun buildDeviceHeader(): String? {
+        val facts = config.device ?: return null
+        val stored = config.storage.get(KEY_INSTALLED_AT)?.toLongOrNull()
+        val installedAt: Long
+        val firstOpen: Boolean
+        if (stored != null && stored > 0) {
+            installedAt = stored
+            firstOpen = false
+        } else {
+            installedAt = config.now()
+            firstOpen = true
+            config.storage.set(KEY_INSTALLED_AT, installedAt.toString())
+        }
+        return facts.encodedHeader(SDK_VERSION, installedAt, firstOpen)
     }
 
     /** Fire-and-forget install beacon; once per customer id. */
@@ -491,6 +530,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         segments: List<String>,
         body: JsonObject? = null,
         query: Map<String, String> = emptyMap(),
+        headers: Map<String, String> = emptyMap(),
     ): String = withContext(Dispatchers.IO) {
         val url = config.baseUrl.toHttpUrl().newBuilder().apply {
             segments.forEach { addPathSegment(it) }
@@ -501,6 +541,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             .url(url)
             .header("Authorization", "Bearer ${config.apiKey}")
             .header("X-Revnix-SDK", "revnix-kotlin/$SDK_VERSION")
+        headers.forEach { (name, value) -> builder.header(name, value) }
 
         if (bgFailures > 0) {
             // Server-visible client pain with zero app wiring.

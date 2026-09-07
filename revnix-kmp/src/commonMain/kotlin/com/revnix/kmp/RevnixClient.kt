@@ -59,13 +59,17 @@ public class RevnixClient(private val config: RevnixConfig) {
     private var inflight: Deferred<CustomerEntitlements>? = null
     private var bgFailures = 0
 
+    /** REV-268: built on the first resolve, kept for the client's lifetime. */
+    private val deviceHeader: String? by lazy { buildDeviceHeader() }
+
     private companion object {
         const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
         const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
         const val CACHE_CUSTOMERS = 4
-        const val SDK_VERSION = "0.2.0"
+        const val SDK_VERSION = "0.3.0"
 
         const val KEY_CUSTOMER_ID = "revnix.customerId"
+        const val KEY_INSTALLED_AT = "revnix.installedAt"
         const val KEY_WALL_CLOCK = "revnix.lastWallClock"
         const val KEY_QUEUE = "revnix.pendingPurchases"
         const val KEY_CACHE_INDEX = "revnix.entIndex"
@@ -275,11 +279,16 @@ public class RevnixClient(private val config: RevnixConfig) {
         // The customer id makes experiment assignment sticky server-side
         // (REV-219); older servers simply ignore the parameter.
         val query = mapOf("customer" to customerId())
+        // REV-268: the device facts ride along so targeting rules see THIS
+        // device on THIS request, and the server stores them as device.*
+        // attributes. Older servers ignore the header.
+        val headers = deviceHeader?.let { mapOf("X-Revnix-Device" to it) }.orEmpty()
         try {
             val raw = request(
                 HttpMethod.Get,
                 listOf("v1", "placements", key, "offering"),
                 query = query,
+                headers = headers,
             )
             val resolution = decode(PlacementResolution.serializer(), raw)
             config.storage.set(placementKey(key), raw)
@@ -290,6 +299,26 @@ public class RevnixClient(private val config: RevnixConfig) {
             return runCatching { decode(PlacementResolution.serializer(), cached) }
                 .getOrElse { throw err }
         }
+    }
+
+    /**
+     * REV-268: assemble the device facts once. `installedAt` is the first launch
+     * this storage ever saw; `firstOpen` is true for the whole of that session.
+     */
+    private fun buildDeviceHeader(): String? {
+        val facts = config.device ?: return null
+        val stored = config.storage.get(KEY_INSTALLED_AT)?.toLongOrNull()
+        val installedAt: Long
+        val firstOpen: Boolean
+        if (stored != null && stored > 0) {
+            installedAt = stored
+            firstOpen = false
+        } else {
+            installedAt = config.now()
+            firstOpen = true
+            config.storage.set(KEY_INSTALLED_AT, installedAt.toString())
+        }
+        return facts.encodedHeader(SDK_VERSION, installedAt, firstOpen)
     }
 
     public suspend fun registerInstall(platform: String? = null, appVersion: String? = null) {
@@ -333,6 +362,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         segments: List<String>,
         body: JsonObject? = null,
         query: Map<String, String> = emptyMap(),
+        headers: Map<String, String> = emptyMap(),
     ): String {
         val url = buildString {
             append(config.baseUrl.trimEnd('/'))
@@ -349,6 +379,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                 this.method = method
                 header("Authorization", "Bearer ${config.apiKey}")
                 header("X-Revnix-SDK", "revnix-kmp/$SDK_VERSION")
+                headers.forEach { (name, value) -> header(name, value) }
                 failuresToReport?.let { header("X-Revnix-Bg-Failures", it.toString()) }
                 if (body != null) {
                     contentType(ContentType.Application.Json)
