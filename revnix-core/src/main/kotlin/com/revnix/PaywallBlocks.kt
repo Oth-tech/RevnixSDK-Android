@@ -520,6 +520,12 @@ public data class PaywallBlockDoc(
     public val accentInk: String,
     public val fontFamily: String?,
     public val blocks: List<PaywallBlock>,
+    /**
+     * REV-271: the design's translations. Empty for a paywall published in one
+     * language, which is every paywall written before this shipped — [localized]
+     * is then a no-op and the tree renders exactly as authored.
+     */
+    public val localization: PaywallLocalization = PaywallLocalization(),
 ) {
     public companion object {
         /** The device screen `canvas` designs are authored against. */
@@ -552,6 +558,7 @@ public data class PaywallBlockDoc(
                 accentInk = o["accentInk"]?.stringOrNull ?: "#FFFFFF",
                 fontFamily = o["fontFamily"]?.stringOrNull,
                 blocks = blocks,
+                localization = PaywallLocalization.parse(o),
             )
         }
 
