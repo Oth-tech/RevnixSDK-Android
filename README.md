@@ -38,6 +38,10 @@ val client = RevnixClient(
         apiKey = "rvx_pk_live_…",
         baseUrl = "https://your-deployment.convex.site",
         storage = AndroidStorage(context),
+        // Device facts sent with every placement resolve (REV-268): platform,
+        // OS version and model are detected by default; this adds the app
+        // version and debuggable flag. Pass null to send nothing.
+        device = AndroidDeviceFacts.detect(context),
     )
 )
 

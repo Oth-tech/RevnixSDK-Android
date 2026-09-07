@@ -100,6 +100,7 @@ class RevnixClientTest {
         readYourWritesDelays: List<Duration> =
             listOf(250.milliseconds, 500.milliseconds, 1.seconds, 2.seconds),
         onDiagnostic: ((RevnixDiagnostic) -> Unit)? = null,
+        device: DeviceFacts? = fixedDevice,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -113,8 +114,21 @@ class RevnixClientTest {
             httpClient = OkHttpClient.Builder()
                 .callTimeout(timeout.inWholeMilliseconds, java.util.concurrent.TimeUnit.MILLISECONDS)
                 .build(),
+            device = device,
         )
     ).also { clients += it }
+
+    /** REV-268: a fixed device so the header is deterministic under test. */
+    private val fixedDevice = DeviceFacts(
+        platform = "android", osVersion = "15", appVersion = "1.2.10", locale = "en-US",
+        currency = "USD", storefront = "US", model = "Pixel 8", sandbox = true,
+    )
+
+    /** Decode the base64url JSON the client put in X-Revnix-Device. */
+    private fun decodeDeviceHeader(header: String) =
+        kotlinx.serialization.json.Json.parseToJsonElement(
+            String(java.util.Base64.getUrlDecoder().decode(header), Charsets.UTF_8)
+        ).jsonObject
 
     /** Route by path substring; each rule may serve a one-shot response first. */
     private fun route(vararg rules: Pair<String, (RecordedRequest) -> MockResponse>) {
@@ -450,6 +464,57 @@ class RevnixClientTest {
         val absentCase = client.resolvePlacement("main")
         assertNull(absentCase.paywallJson)
         assertNull(absentCase.experimentJson)
+    }
+
+    // MARK: - Device attribute contract (REV-268)
+
+    @Test
+    fun `every resolve carries the device facts with the SDK-owned fields added`() = runBlocking {
+        route("/placements" to { json(200, placementBody) })
+        val storage = MemoryStorage()
+        val client = makeClient(now = { 1_700_000_000_000 }, storage = storage)
+        client.resolvePlacement("main")
+        val header = server.takeRequest().getHeader("X-Revnix-Device")
+        assertNotNull(header)
+        val facts = decodeDeviceHeader(header)
+        assertEquals("android", facts["platform"]?.jsonPrimitive?.content)
+        assertEquals("15", facts["osVersion"]?.jsonPrimitive?.content)
+        assertEquals("1.2.10", facts["appVersion"]?.jsonPrimitive?.content)
+        assertEquals("en-US", facts["locale"]?.jsonPrimitive?.content)
+        assertEquals("USD", facts["currency"]?.jsonPrimitive?.content)
+        assertEquals("US", facts["storefront"]?.jsonPrimitive?.content)
+        assertEquals("Pixel 8", facts["model"]?.jsonPrimitive?.content)
+        assertEquals("true", facts["sandbox"]?.jsonPrimitive?.content)
+        assertEquals("1700000000000", facts["installedAt"]?.jsonPrimitive?.content)
+        assertEquals("true", facts["firstOpen"]?.jsonPrimitive?.content)
+        assertNotNull(facts["sdkVersion"])
+        assertEquals("1700000000000", storage.get("revnix.installedAt"))
+
+        // A later session on the same storage: same install date, not the
+        // first open any more.
+        val later = makeClient(now = { 1_700_086_400_000 }, storage = storage)
+        later.resolvePlacement("main")
+        val second = decodeDeviceHeader(server.takeRequest().getHeader("X-Revnix-Device")!!)
+        assertEquals("1700000000000", second["installedAt"]?.jsonPrimitive?.content)
+        assertEquals("false", second["firstOpen"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `device facts can be disabled and the header is then absent`() = runBlocking {
+        route("/placements" to { json(200, placementBody) })
+        val client = makeClient(device = null)
+        client.resolvePlacement("main")
+        assertNull(server.takeRequest().getHeader("X-Revnix-Device"))
+    }
+
+    @Test
+    fun `detect answers from the running JVM`() {
+        val facts = DeviceFacts.detect()
+        assertNotNull(facts.locale)
+        // No Android on a plain JVM test run: platform and model stay unknown
+        // rather than guessed.
+        assertNull(facts.platform)
+        assertNull(facts.model)
     }
 
     // MARK: - Experiments (REV-219)

@@ -34,4 +34,11 @@ public data class RevnixConfig(
      * shipped public config unchanged.
      */
     val httpClient: HttpClient? = null,
+    /**
+     * REV-268: facts about the device, sent with every placement resolve so
+     * targeting rules can be evaluated on the request that serves the paywall,
+     * and stored on the customer as reserved `device.*` attributes. Defaults to
+     * [detectDeviceFacts]; pass null to send nothing.
+     */
+    val device: DeviceFacts? = detectDeviceFacts(),
 )

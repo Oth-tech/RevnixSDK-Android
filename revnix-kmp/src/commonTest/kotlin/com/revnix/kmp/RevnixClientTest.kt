@@ -113,11 +113,13 @@ class RevnixClientTest {
         entitlementsTtl: Duration = 30.seconds,
         readYourWritesDelays: List<Duration> = listOf(1.milliseconds, 1.milliseconds),
         onDiagnostic: ((RevnixDiagnostic) -> Unit)? = null,
+        device: DeviceFacts? = fixedDevice,
         handler: (path: String, call: Int) -> Pair<HttpStatusCode, String>?,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
             baseUrl = "https://example.convex.site",
+            device = device,
             storage = storage,
             entitlementsTtl = entitlementsTtl,
             readYourWritesDelays = readYourWritesDelays,
@@ -130,6 +132,99 @@ class RevnixClientTest {
     )
 
     private fun ok(body: String) = HttpStatusCode.OK to body
+
+    /** REV-268: a fixed device so the header is deterministic on every target. */
+    private val fixedDevice = DeviceFacts(
+        platform = "ios", osVersion = "18.1", appVersion = "1.2.10", locale = "en_US",
+        currency = "USD", storefront = "USA", model = "iPhone15,3", sandbox = true,
+    )
+
+    /** Decode the base64url JSON the client put in X-Revnix-Device. */
+    private fun decodeDeviceHeader(header: String) =
+        kotlinx.serialization.json.Json.parseToJsonElement(
+            base64UrlDecode(header).decodeToString()
+        ).jsonObject
+
+    // MARK: - Device attribute contract (REV-268)
+
+    @Test
+    fun every_resolve_carries_the_device_facts_with_the_sdk_owned_fields_added() = runTest {
+        val rec = Recorder()
+        val storage = MemoryStorage()
+        val client = makeClient(rec, storage = storage) { _, _ -> ok(placementBody) }
+        client.resolvePlacement("main")
+        val header = rec.lastHeader("X-Revnix-Device", "offering")
+        assertNotNull(header)
+        val facts = decodeDeviceHeader(header)
+        assertEquals("ios", facts["platform"]?.jsonPrimitive?.content)
+        assertEquals("18.1", facts["osVersion"]?.jsonPrimitive?.content)
+        assertEquals("1.2.10", facts["appVersion"]?.jsonPrimitive?.content)
+        assertEquals("en_US", facts["locale"]?.jsonPrimitive?.content)
+        assertEquals("USD", facts["currency"]?.jsonPrimitive?.content)
+        assertEquals("USA", facts["storefront"]?.jsonPrimitive?.content)
+        assertEquals("iPhone15,3", facts["model"]?.jsonPrimitive?.content)
+        assertEquals("true", facts["sandbox"]?.jsonPrimitive?.content)
+        assertEquals("1700000000000", facts["installedAt"]?.jsonPrimitive?.content)
+        assertEquals("true", facts["firstOpen"]?.jsonPrimitive?.content)
+        assertNotNull(facts["sdkVersion"])
+        client.close()
+
+        // A later session on the same storage: same install date, not the
+        // first open any more.
+        val later = makeClient(rec, storage = storage, now = { 1_700_086_400_000 }) { _, _ ->
+            ok(placementBody)
+        }
+        later.resolvePlacement("main")
+        val second = decodeDeviceHeader(rec.lastHeader("X-Revnix-Device", "offering")!!)
+        assertEquals("1700000000000", second["installedAt"]?.jsonPrimitive?.content)
+        assertEquals("false", second["firstOpen"]?.jsonPrimitive?.content)
+        later.close()
+    }
+
+    @Test
+    fun device_facts_can_be_disabled_and_the_header_is_then_absent() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec, device = null) { _, _ -> ok(placementBody) }
+        client.resolvePlacement("main")
+        assertNull(rec.lastHeader("X-Revnix-Device", "offering"))
+        client.close()
+    }
+
+    @Test
+    fun base64url_round_trips_utf8_without_padding() {
+        val text = "{\"model\":\"iPhone15,3\",\"locale\":\"ja_JP\",\"name\":\"端末\"}"
+        val encoded = base64Url(text.encodeToByteArray())
+        assertFalse(encoded.contains('='))
+        assertFalse(encoded.contains('+'))
+        assertFalse(encoded.contains('/'))
+        assertEquals(text, base64UrlDecode(encoded).decodeToString())
+    }
+
+    @Test
+    fun detect_answers_from_the_running_target() {
+        val facts = detectDeviceFacts()
+        assertNotNull(facts.platform)
+        assertNotNull(facts.locale)
+    }
+
+    /** Test-side inverse of base64Url, so the round trip proves the encoder. */
+    private fun base64UrlDecode(text: String): ByteArray {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        val out = ArrayList<Byte>(text.length * 3 / 4)
+        var buffer = 0
+        var bits = 0
+        for (ch in text) {
+            val value = alphabet.indexOf(ch)
+            require(value >= 0) { "not base64url: $ch" }
+            buffer = (buffer shl 6) or value
+            bits += 6
+            if (bits >= 8) {
+                bits -= 8
+                out.add(((buffer shr bits) and 0xff).toByte())
+            }
+        }
+        return out.toByteArray()
+    }
 
     // MARK: - Typed errors
 
