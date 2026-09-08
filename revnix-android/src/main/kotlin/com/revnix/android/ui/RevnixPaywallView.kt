@@ -51,8 +51,10 @@ import com.revnix.PaywallBlockDoc
 import com.revnix.PaywallConfig
 import com.revnix.RevnixClient
 import com.revnix.RevnixPaywallEvent
+import com.revnix.localized
 import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBlockColor
+import com.revnix.revnixDeviceLocale
 import com.revnix.revnixSelectedPackageId
 import java.net.HttpURLConnection
 import java.net.URL
@@ -204,6 +206,21 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private var onPrivacy: (() -> Unit)? = null
     private var onClose: (() -> Unit)? = null
     private var themeOverride: RevnixPaywallThemeOverride? = null
+
+    /**
+     * REV-271: which language a designed paywall draws its copy in. Null uses
+     * the device's own, which is what makes the paywall match the rest of the
+     * app; set it when the app has its own in-app language switch, so the
+     * paywall follows the app rather than the OS. A paywall with no
+     * translations ignores it, and any string the chosen language does not
+     * translate falls back to the authored copy rather than rendering blank.
+     */
+    public var locale: String? = null
+        set(value) {
+            val changed = field != value
+            field = value
+            if (changed && config != null) render()
+        }
 
     // ——— REV-252: this display's close reporting ———
     /** The client bind() was given, kept so a dismissal can report itself. */
@@ -494,7 +511,11 @@ public class RevnixPaywallView @JvmOverloads constructor(
         // classic layouts below, which stay the fallback for every paywall
         // published before the block builder — so anything already live
         // renders unchanged.
+        // REV-271: the language overlay is applied ONCE, here, so every
+        // renderer path below reads plain strings and none can forget to
+        // localize one. A paywall with no translations returns itself.
         val blockDoc = PaywallBlockDoc.parse(config.blocks)
+            ?.localized(locale ?: revnixDeviceLocale())
         blockPaywall = blockDoc != null && renderBlocks(blockDoc, config)
         if (blockPaywall) return
 
