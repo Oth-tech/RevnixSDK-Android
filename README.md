@@ -180,6 +180,38 @@ All of these are fire-and-forget: failures go to `onDiagnostic`, never to your
 call site, and all are pure ledger history — over-reporting can skew a report,
 never grant or revoke access.
 
+### Implicit placements
+
+Six placements resolve without a `resolvePlacement` call: `app_install`,
+`app_launch`, `session_start`, `deeplink_open`, `paywall_decline` and
+`transaction_abandon`. Passing `onImplicitPaywall` to `RevnixConfig` turns
+them on (off by default — no handler, no extra requests); the SDK then asks
+`GET /v1/config` once and fires only for the moments the dashboard configured.
+
+```kotlin
+val client = RevnixClient(RevnixConfig(
+    apiKey = "rvx_pk_live_…", baseUrl = "https://….convex.site",
+    storage = AndroidStorage(app),
+    // revnix-core has no Android dependency, so the foreground source that
+    // session_start is built on comes from revnix-android — no androidx.lifecycle.
+    lifecycle = AndroidLifecycle(app),
+    onImplicitPaywall = { trigger ->
+        // Off the main thread — post before touching views.
+        mainHandler.post { showPaywall(trigger.resolution) }
+    },
+))
+
+// deeplink_open is the one moment the SDK cannot see itself:
+intent.data?.let { scope.launch { client.handleDeepLink(it.toString()) } }
+```
+
+When you bind it, pass `placementKey = trigger.resolution.placementKey` —
+that marks the display as implicit and is what stops a `paywall_decline`
+paywall from firing `paywall_decline` again. A close is a decline: never
+report one for a display that ended in a purchase. `close()` retires the
+foreground listener; `sessionTimeoutMs` (default 30 min) is the session
+boundary.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
