@@ -427,6 +427,30 @@ class RevnixClientTest {
     }
 
     @Test
+    fun is_entitled_answers_false_for_a_revoked_key_even_with_an_active_entitlement_cached() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec, entitlementsTtl = Duration.ZERO) { _, call ->
+            if (call == 0) ok(entitlementsBody)
+            else HttpStatusCode.Unauthorized to """{"error":"revoked"}"""
+        }
+        client.entitlements()
+        assertFalse(client.isEntitled("pro"))
+        client.close()
+    }
+
+    @Test
+    fun is_entitled_still_serves_the_cache_on_a_transient_failure() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec, entitlementsTtl = Duration.ZERO) { _, call ->
+            if (call == 0) ok(entitlementsBody)
+            else HttpStatusCode.InternalServerError to """{"error":"down"}"""
+        }
+        client.entitlements()
+        assertTrue(client.isEntitled("pro"))
+        client.close()
+    }
+
+    @Test
     fun an_unknown_placement_404_is_not_papered_over_by_the_cache() = runTest {
         val rec = Recorder()
         val client = makeClient(rec) { _, call ->

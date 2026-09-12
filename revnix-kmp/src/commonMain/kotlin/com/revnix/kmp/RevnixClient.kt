@@ -157,12 +157,12 @@ public class RevnixClient(private val config: RevnixConfig) {
         return applyOfflinePolicy(entry, nowMs, updateWallClock(nowMs))
     }
 
-    /** Gate helper — never throws; unknown/unreachable = locked. */
+    /** Gate helper: never throws. A transient failure answers from the offline cache; a deliberate rejection (401/403/404/409), an unknown id, or no cache answers false. */
     public suspend fun isEntitled(entitlementId: String): Boolean {
         val snapshot = try {
             entitlements()
         } catch (_: RevnixError) {
-            cachedEntitlements()
+            null
         }
         return snapshot?.entitlements?.any { it.entitlementId == entitlementId && it.isActive }
             ?: false
