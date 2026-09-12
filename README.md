@@ -17,7 +17,7 @@ Requires Android minSdk 24 and JDK 17.
 |---|---|
 | `revnix-core` | Pure JVM client: entitlements, cache policy, purchases, retry queue. No Android dependency, so the resilience matrix runs as a plain JVM test task. |
 | `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`), `AndroidStorage`, and the `RevnixPaywallView` paywall renderer. |
-| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy (but no `setAttributes` yet, see Targeting below), Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
+| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy (but no `setAttributes`, `logPaywallDisplay`/`logPaywallClosed`/`logPaywallEvent`, implicit placements or paywall view yet), Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
 ## Install
 
@@ -126,9 +126,10 @@ val view = RevnixPaywallView(context)
 view.bind(
     config = paywall.config,
     packages = listOf(
-        // priceLabel MUST be the store's localized price (ProductDetails).
-        RevnixPaywallPackage("monthly", "Monthly", monthlyDetails.formattedPrice),
-        RevnixPaywallPackage("annual", "Annual", annualDetails.formattedPrice),
+        // priceLabel MUST be the store's localized price: a ProductDetails
+        // pricing phase's (or one-time offer's) formattedPrice.
+        RevnixPaywallPackage("monthly", "Monthly", monthlyPrice),
+        RevnixPaywallPackage("annual", "Annual", annualPrice),
     ),
     onPurchase = { packageId -> billing.launchPurchase(activity, detailsFor(packageId)) },
     onRestore = { /* replay owned purchases */ },
@@ -143,9 +144,14 @@ view.loading = true                   // spinner in the CTA while purchasing
 
 All nine `template` layouts render (unknown future layouts fall back to the
 classic structure), `mode` picks the dark/light palette, and a
-`RevnixPaywallThemeOverride` restyles individual colors on top. Footer
+`RevnixPaywallThemeOverride` restyles individual colors on top. A config that
+carries a designed paywall (`blocks`, from the dashboard's block builder)
+renders that instead, with the template as the fallback. Footer
 Terms/Privacy links prefer your `onTerms`/`onPrivacy` handlers and fall back
-to opening the config's URLs.
+to opening the config's URLs. Pass `onClose` to draw a close button: the view
+calls you, you perform the dismissal, and with `client` set it reports
+`paywall.closed`. The `locale` property picks a designed paywall's language
+(default: the device's).
 
 ### Reporting a display you render yourself
 
@@ -160,7 +166,9 @@ paywall, the three calls are yours:
 
 The purchase **outcome** is always yours, even with the built-in renderer:
 your app makes the Play Billing call, so only your app sees whether the sheet
-was cancelled or the card was declined.
+was cancelled or the card was declined. `PlayBillingConnector` keeps its
+`PurchasesUpdatedListener` to itself, so this needs a flow launched by your
+own `BillingClient`.
 
 ```kotlin
 val viewId = client.logPaywallDisplay(placementKey, paywall.paywallId)
@@ -187,6 +195,7 @@ Six placements resolve without a `resolvePlacement` call: `app_install`,
 `transaction_abandon`. Passing `onImplicitPaywall` to `RevnixConfig` turns
 them on (off by default — no handler, no extra requests); the SDK then asks
 `GET /v1/config` once and fires only for the moments the dashboard configured.
+`implicitPlacements = false` turns them off even with a handler set.
 
 ```kotlin
 val client = RevnixClient(RevnixConfig(
@@ -256,11 +265,16 @@ agreement with it and with the Swift port.
 fresh ledger cursor), and resolves with the last read rather than throwing if
 the ledger never catches up.
 
+`isEntitled` never throws: on a transient failure `entitlements()` serves the
+offline-policy cache (flagged `stale`); a deliberate rejection
+(401/403/404/409), an unknown id, or a failed read with no cache answers
+`false`.
+
 ## Tests
 
 ```sh
-./gradlew :revnix-core:test     # 31 tests, the resilience matrix
-./gradlew :revnix-kmp:allTests  # 30 tests, the same matrix, Ktor transport
+./gradlew :revnix-core:test     # 163 tests, the resilience matrix plus the paywall model
+./gradlew :revnix-kmp:allTests  # 39 tests, the same matrix, Ktor transport
 ```
 
 `revnix-core` runs against OkHttp's `MockWebServer`; `revnix-kmp` runs the
@@ -279,5 +293,5 @@ purchases in a sandbox app, not by either suite.
 **Not yet published.** `com.revnix:revnix-android:0.2.0` is the intended
 coordinate, but nothing is on Maven Central yet, so that dependency will not
 resolve. Until it ships, apps integrate over the
-[REST API](https://revnix.io/docs/android), the same `/v1` contract this SDK
+[REST API](https://revnix.io/docs/rest-api), the same `/v1` contract this SDK
 speaks, so migrating later does not change the backend integration.

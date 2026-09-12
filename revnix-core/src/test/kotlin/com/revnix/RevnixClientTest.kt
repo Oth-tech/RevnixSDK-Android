@@ -357,6 +357,26 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `isEntitled answers false for a revoked key even with an active entitlement cached`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody)) {
+            json(401, """{"error":"revoked"}""")
+        })
+        val client = makeClient(entitlementsTtl = Duration.ZERO)
+        client.entitlements()
+        assertFalse(client.isEntitled("pro"))
+    }
+
+    @Test
+    fun `isEntitled still serves the cache on a transient failure`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody)) {
+            json(503, """{"error":"unavailable"}""")
+        })
+        val client = makeClient(entitlementsTtl = Duration.ZERO)
+        client.entitlements()
+        assertTrue(client.isEntitled("pro"))
+    }
+
+    @Test
     fun `an unknown placement 404 is not papered over by the cache`() = runBlocking {
         route("/placements" to onceThen(json(200, placementBody)) {
             json(404, """{"error":"unknown placement"}""")
