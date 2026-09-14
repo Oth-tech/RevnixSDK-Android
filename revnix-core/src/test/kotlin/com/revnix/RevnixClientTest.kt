@@ -101,6 +101,8 @@ class RevnixClientTest {
             listOf(250.milliseconds, 500.milliseconds, 1.seconds, 2.seconds),
         onDiagnostic: ((RevnixDiagnostic) -> Unit)? = null,
         device: DeviceFacts? = fixedDevice,
+        onImplicitPaywall: ((RevnixImplicitTrigger) -> Unit)? = null,
+        implicitPlacements: Boolean? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -115,6 +117,8 @@ class RevnixClientTest {
                 .callTimeout(timeout.inWholeMilliseconds, java.util.concurrent.TimeUnit.MILLISECONDS)
                 .build(),
             device = device,
+            onImplicitPaywall = onImplicitPaywall,
+            implicitPlacements = implicitPlacements,
         )
     ).also { clients += it }
 
@@ -750,6 +754,137 @@ class RevnixClientTest {
         val client = makeClient(onDiagnostic = { events += it.op })
         assertFailsWith<RevnixError.Network> { client.entitlements() }
         Unit
+    }
+
+    private val previewToken = "a".repeat(64)
+
+    private val previewBodyWithoutStatusRevisionOffering = """
+        {"placementKey":"revnix_preview","revision":null,"offering":null,"paywall":{"paywallId":"pw_preview","name":"Preview","config":{"template":"focus","headline":"Preview","features":[],"ctaLabel":"Continue"}},"experiment":null,"targeting":null,"preview":true,"expiresAt":1800000000000}
+    """.trimIndent()
+
+    @Test
+    fun `a preview link fetches the preview and hands it to onImplicitPaywall, never triggered`() =
+        runBlocking {
+            route(
+                "v1/config" to { json(200, """{"implicitPlacements":["deeplink_open"]}""") },
+                "paywalls/preview/$previewToken" to { json(200, previewBodyWithoutStatusRevisionOffering) },
+                "placements/triggered" to { json(200, paywallLegacyBody) },
+            )
+            val seen = mutableListOf<RevnixImplicitTrigger>()
+            val client = makeClient(onImplicitPaywall = { seen += it })
+
+            client.handleDeepLink("voigu://revnix-preview?revnix_preview=$previewToken")
+
+            val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }.toList()
+            assertTrue(requests.any { it.path.orEmpty().contains("paywalls/preview/$previewToken") })
+            assertTrue(requests.none { it.path.orEmpty().contains("placements/triggered") })
+            assertEquals(1, seen.size)
+            assertEquals(RevnixImplicitPlacement.DEEPLINK_OPEN, seen.single().placement)
+            assertEquals(REVNIX_PREVIEW_PLACEMENT_KEY, seen.single().resolution.placementKey)
+            assertEquals(true, seen.single().resolution.preview)
+        }
+
+    @Test
+    fun `a preview body with null revision, no status and null offering parses`() = runBlocking {
+        route("paywalls/preview/$previewToken" to { json(200, previewBodyWithoutStatusRevisionOffering) })
+        val seen = mutableListOf<RevnixImplicitTrigger>()
+        val client = makeClient(onImplicitPaywall = { seen += it }, implicitPlacements = false)
+
+        client.handleDeepLink("voigu://revnix-preview?revnix_preview=$previewToken")
+
+        val resolution = seen.single().resolution
+        assertEquals("ok", resolution.status)
+        assertEquals(0L, resolution.revision)
+        assertEquals("", resolution.offering.offeringId)
+        assertEquals("pw_preview", resolution.paywall?.paywallId)
+    }
+
+    @Test
+    fun `a preview on the first frame waits for the launch batch, presenting after it`() =
+        runBlocking {
+            route(
+                "v1/config" to { json(200, """{"implicitPlacements":["app_launch"]}""") },
+                "placements/triggered" to { json(200, paywallLegacyBody) },
+                "paywalls/preview/$previewToken" to { json(200, previewBodyWithoutStatusRevisionOffering) },
+            )
+            val seen = mutableListOf<RevnixImplicitTrigger>()
+            val client = makeClient(onImplicitPaywall = { seen += it })
+            assertTrue(
+                server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)!!.path!!.contains("v1/config"),
+            )
+
+            client.handleDeepLink("voigu://revnix-preview?revnix_preview=$previewToken")
+
+            assertEquals(
+                listOf(RevnixImplicitPlacement.APP_LAUNCH, RevnixImplicitPlacement.DEEPLINK_OPEN),
+                seen.map { it.placement },
+            )
+            assertEquals(REVNIX_PREVIEW_PLACEMENT_KEY, seen.last().resolution.placementKey)
+        }
+
+    @Test
+    fun `no onImplicitPaywall handler configured, a preview does not throw`() = runBlocking {
+        route("paywalls/preview/$previewToken" to { json(200, previewBodyWithoutStatusRevisionOffering) })
+        val client = makeClient(implicitPlacements = false)
+
+        client.handleDeepLink("voigu://revnix-preview?revnix_preview=$previewToken")
+    }
+
+    @Test
+    fun `a malformed token falls through to the ordinary deep-link path`() = runBlocking {
+        route(
+            "v1/config" to { json(200, """{"implicitPlacements":["deeplink_open"]}""") },
+            "placements/triggered" to { json(200, paywallLegacyBody) },
+        )
+        val seen = mutableListOf<RevnixImplicitTrigger>()
+        val client = makeClient(onImplicitPaywall = { seen += it })
+
+        client.handleDeepLink("voigu://revnix-preview?revnix_preview=not-hex")
+
+        val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }
+        assertTrue(requests.any { it.path.orEmpty().contains("placements/triggered") })
+        assertEquals(RevnixImplicitPlacement.DEEPLINK_OPEN, seen.single().placement)
+    }
+
+    @Test
+    fun `an ordinary URL is unaffected`() = runBlocking {
+        route(
+            "v1/config" to { json(200, """{"implicitPlacements":["deeplink_open"]}""") },
+            "placements/triggered" to { json(200, paywallLegacyBody) },
+        )
+        val seen = mutableListOf<RevnixImplicitTrigger>()
+        val client = makeClient(onImplicitPaywall = { seen += it })
+
+        client.handleDeepLink("https://example.com/promo")
+
+        val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }
+        assertTrue(requests.any { it.path.orEmpty().contains("placements/triggered") })
+        assertEquals(RevnixImplicitPlacement.DEEPLINK_OPEN, seen.single().placement)
+    }
+
+    @Test
+    fun `a 404 preview never throws and never presents`() = runBlocking {
+        route("paywalls/preview/$previewToken" to { json(404, """{"error":"not found"}""") })
+        val seen = mutableListOf<RevnixImplicitTrigger>()
+        val diagnostics = mutableListOf<String>()
+        val client = makeClient(
+            onImplicitPaywall = { seen += it },
+            implicitPlacements = false,
+            onDiagnostic = { diagnostics += it.op },
+        )
+
+        client.handleDeepLink("voigu://revnix-preview?revnix_preview=$previewToken")
+
+        assertTrue(seen.isEmpty())
+        assertTrue(diagnostics.contains("preview"))
+    }
+
+    @Test
+    fun `logPaywallDisplay (logPaywallShown) with the preview key sends no request`() = runBlocking {
+        val client = makeClient()
+        val viewId = client.logPaywallDisplay(REVNIX_PREVIEW_PLACEMENT_KEY, "pw_preview")
+        assertNotNull(viewId)
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
 }
 

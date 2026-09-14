@@ -214,6 +214,15 @@ val client = RevnixClient(RevnixConfig(
 intent.data?.let { scope.launch { client.handleDeepLink(it.toString()) } }
 ```
 
+A dashboard QR/link preview (`<scheme>://revnix-preview?revnix_preview=<token>`)
+goes through the same `handleDeepLink` call — recognised by its own URL shape,
+not by `deeplink_open` being configured — and is always handed to
+`onImplicitPaywall`. Tell it apart from a real trigger with
+`trigger.resolution.placementKey == REVNIX_PREVIEW_PLACEMENT_KEY` /
+`trigger.resolution.preview`: `RevnixPaywallView` already refuses to invoke
+`onPurchase` for one, showing "Purchases are disabled in preview." instead,
+and no paywall analytics are sent for it.
+
 When you bind it, pass `placementKey = trigger.resolution.placementKey` —
 that marks the display as implicit and is what stops a `paywall_decline`
 paywall from firing `paywall_decline` again. A close is a decline: never

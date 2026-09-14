@@ -275,6 +275,8 @@ public data class PlacementResolution(
     val paywallJson: JsonElement? = null,
     /** `experiment` as the server sent it; same purpose as [paywallJson]. */
     val experimentJson: JsonElement? = null,
+    /** Set only on a dashboard QR/link preview resolution, never on a real resolve. */
+    val preview: Boolean? = null,
 )
 
 /**
