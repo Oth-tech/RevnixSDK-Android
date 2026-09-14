@@ -46,9 +46,11 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import com.revnix.BlockPackage
 import com.revnix.PaywallBlockDoc
 import com.revnix.PaywallConfig
+import com.revnix.REVNIX_PREVIEW_PLACEMENT_KEY
 import com.revnix.RevnixClient
 import com.revnix.RevnixPaywallEvent
 import com.revnix.localized
@@ -433,6 +435,10 @@ public class RevnixPaywallView @JvmOverloads constructor(
      * occurrence rather than a duplicate of the first try.
      */
     private fun purchaseAndReport(packageId: String) {
+        if (reportPlacementKey == REVNIX_PREVIEW_PLACEMENT_KEY) {
+            Toast.makeText(context, "Purchases are disabled in preview.", Toast.LENGTH_SHORT).show()
+            return
+        }
         purchaseAttempts += 1
         reportInteraction(
             RevnixPaywallEvent.PurchaseStarted,

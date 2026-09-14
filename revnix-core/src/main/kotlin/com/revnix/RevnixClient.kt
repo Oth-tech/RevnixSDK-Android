@@ -154,6 +154,8 @@ public class RevnixClient(private val config: RevnixConfig) {
          * good network still works.
          */
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
+
+        val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
     }
 
     // MARK: - Identity
@@ -471,6 +473,7 @@ public class RevnixClient(private val config: RevnixConfig) {
      */
     public suspend fun logPaywallDisplay(placementKey: String?, paywallId: String?): String {
         val viewId = UUID.randomUUID().toString().lowercase()
+        if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return viewId
         // REV-272 LOOP GUARD: a display whose placement is one of the six came
         // FROM an implicit trigger, so its dismissal must not fire another one
         // — otherwise "show a win-back when a paywall is declined" hands the
@@ -516,6 +519,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         placementKey: String?,
         paywallId: String?,
     ) {
+        if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return
         val body = buildJsonObject {
             put("customerId", JsonPrimitive(customerId()))
             put("viewId", JsonPrimitive(viewId))
@@ -569,6 +573,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         message: String? = null,
         eventId: String? = null,
     ) {
+        if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return
         val body = buildJsonObject {
             put("customerId", JsonPrimitive(customerId()))
             put("viewId", JsonPrimitive(viewId))
@@ -699,14 +704,62 @@ public class RevnixClient(private val config: RevnixConfig) {
      * on the first frame, while the cold-start batch is still deciding what to
      * show, it waits for the batch and presents only if the batch showed
      * nothing — the moment is reported either way.
+     *
+     * A dashboard QR/link preview (`<scheme>://revnix-preview?revnix_preview=<token>`,
+     * scanned or tapped) is recognised here too and is always presented —
+     * `deeplink_open` never fires for it, and it never reports the ledger
+     * event `deeplink_open` does. `onImplicitPaywall`'s trigger carries
+     * `RevnixImplicitPlacement.DEEPLINK_OPEN` (a deep link is what opened the
+     * app); `resolution.placementKey` is [REVNIX_PREVIEW_PLACEMENT_KEY] and
+     * `resolution.preview` is true, which is how a host tells a preview apart
+     * from a real deep-link paywall.
      */
     public suspend fun handleDeepLink(url: String) {
+        val previewToken = PREVIEW_TOKEN_REGEX.find(url)?.groupValues?.get(1)
+        if (previewToken != null) {
+            presentPreview(previewToken)
+            return
+        }
         val present = launchBatch?.let { !it.await() } ?: true
         fireImplicit(
             RevnixImplicitPlacement.DEEPLINK_OPEN,
             buildJsonObject { put("url", JsonPrimitive(url.take(1024))) },
             present = present,
         )
+    }
+
+    private suspend fun presentPreview(token: String) {
+        launchBatch?.await()
+        try {
+            val raw = request("GET", listOf("v1", "paywalls", "preview", token))
+            val resolution = decodePreviewResolution(raw)
+            config.onImplicitPaywall?.invoke(
+                RevnixImplicitTrigger(
+                    placement = RevnixImplicitPlacement.DEEPLINK_OPEN,
+                    resolution = resolution,
+                ),
+            )
+        } catch (err: Throwable) {
+            bgFailures += 1
+            diagnostic("preview", err.message.orEmpty())
+        }
+    }
+
+    private fun decodePreviewResolution(raw: String): PlacementResolution {
+        val obj = json.parseToJsonElement(raw).jsonObject
+        val patched = JsonObject(
+            obj + mapOf(
+                "status" to JsonPrimitive("ok"),
+                "revision" to (obj["revision"]?.takeUnless { it is JsonNull } ?: JsonPrimitive(0)),
+                "offering" to (
+                    obj["offering"]?.takeUnless { it is JsonNull } ?: buildJsonObject {
+                        put("offeringId", JsonPrimitive(""))
+                        put("displayName", JsonPrimitive(""))
+                    }
+                ),
+            )
+        )
+        return json.decodeFromJsonElement(PlacementResolution.serializer(), patched).copy(preview = true)
     }
 
     /** Which of the six this app has configured. See [implicitConfigJob]. */

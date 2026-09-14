@@ -35,6 +35,14 @@ public enum class RevnixImplicitPlacement(public val key: String) {
 }
 
 /**
+ * The `placementKey` a dashboard QR/link preview resolution carries
+ * (`<scheme>://revnix-preview?revnix_preview=<token>`). Mirrors the server's
+ * spelling, not one of the six above — a preview is never in
+ * [RevnixImplicitPlacement] and never sent to `/v1/placements/triggered`.
+ */
+public const val REVNIX_PREVIEW_PLACEMENT_KEY: String = "revnix_preview"
+
+/**
  * What the host is handed when a moment resolved to a paywall. Only ever
  * delivered WITH a paywall — a moment the server answered with none (nothing
  * attached, or the same paywall the customer is leaving) is reported and then
