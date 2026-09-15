@@ -863,6 +863,86 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `no handler, a deep link reports link facts only with resolve false and no config read`() =
+        runBlocking {
+            route("placements/triggered" to { json(200, paywallLegacyBody) })
+            val client = makeClient()
+
+            client.handleDeepLink("https://example.com/promo?utm_source=ig")
+
+            val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }.toList()
+            assertEquals(1, requests.size)
+            assertTrue(requests.single().path.orEmpty().contains("placements/triggered"))
+            val sent = kotlinx.serialization.json.Json.parseToJsonElement(
+                requests.single().body.readUtf8(),
+            ).jsonObject
+            assertEquals("https://example.com/promo?utm_source=ig", sent["url"]!!.jsonPrimitive.content)
+            assertEquals(false, sent["resolve"]!!.jsonPrimitive.content.toBoolean())
+        }
+
+    @Test
+    fun `implicit placements off with a handler, resolve false and the handler never fires`() =
+        runBlocking {
+            route("placements/triggered" to { json(200, paywallLegacyBody) })
+            val seen = mutableListOf<RevnixImplicitTrigger>()
+            val client = makeClient(onImplicitPaywall = { seen += it }, implicitPlacements = false)
+
+            client.handleDeepLink("https://example.com/promo")
+
+            val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }.toList()
+            val sent = kotlinx.serialization.json.Json.parseToJsonElement(
+                requests.single { it.path.orEmpty().contains("placements/triggered") }.body.readUtf8(),
+            ).jsonObject
+            assertEquals(false, sent["resolve"]!!.jsonPrimitive.content.toBoolean())
+            assertTrue(seen.isEmpty())
+        }
+
+    @Test
+    fun `implicit placements on with a handler, the trigger body carries no resolve key`() =
+        runBlocking {
+            route(
+                "v1/config" to { json(200, """{"implicitPlacements":["deeplink_open"]}""") },
+                "placements/triggered" to { json(200, paywallLegacyBody) },
+            )
+            val seen = mutableListOf<RevnixImplicitTrigger>()
+            val client = makeClient(onImplicitPaywall = { seen += it })
+
+            client.handleDeepLink("https://example.com/promo")
+
+            val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }.toList()
+            val sent = kotlinx.serialization.json.Json.parseToJsonElement(
+                requests.single { it.path.orEmpty().contains("placements/triggered") }.body.readUtf8(),
+            ).jsonObject
+            assertFalse(sent.containsKey("resolve"))
+            assertEquals(RevnixImplicitPlacement.DEEPLINK_OPEN, seen.single().placement)
+            assertNotNull(seen.single().resolution.paywall)
+        }
+
+    @Test
+    fun `implicit on, config lists only paywall_decline, the deep-link trigger resolves false and never presents`() =
+        runBlocking {
+            route(
+                "v1/config" to { json(200, """{"implicitPlacements":["paywall_decline"]}""") },
+                "placements/triggered" to { json(200, paywallLegacyBody) },
+            )
+            val seen = mutableListOf<RevnixImplicitTrigger>()
+            val client = makeClient(onImplicitPaywall = { seen += it })
+            assertTrue(
+                server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)!!.path!!.contains("v1/config"),
+            )
+
+            client.handleDeepLink("https://example.com/promo")
+
+            val requests = generateSequence { server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS) }.toList()
+            val deepLinkBody = requests
+                .filter { it.path.orEmpty().contains("placements/triggered") }
+                .map { kotlinx.serialization.json.Json.parseToJsonElement(it.body.readUtf8()).jsonObject }
+                .single { it["placement"]!!.jsonPrimitive.content == "deeplink_open" }
+            assertEquals(false, deepLinkBody["resolve"]!!.jsonPrimitive.content.toBoolean())
+            assertTrue(seen.isEmpty())
+        }
+
+    @Test
     fun `a 404 preview never throws and never presents`() = runBlocking {
         route("paywalls/preview/$previewToken" to { json(404, """{"error":"not found"}""") })
         val seen = mutableListOf<RevnixImplicitTrigger>()

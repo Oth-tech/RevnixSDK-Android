@@ -193,9 +193,12 @@ never grant or revoke access.
 Six placements resolve without a `resolvePlacement` call: `app_install`,
 `app_launch`, `session_start`, `deeplink_open`, `paywall_decline` and
 `transaction_abandon`. Passing `onImplicitPaywall` to `RevnixConfig` turns
-them on (off by default — no handler, no extra requests); the SDK then asks
-`GET /v1/config` once and fires only for the moments the dashboard configured.
-`implicitPlacements = false` turns them off even with a handler set.
+them on (off by default — no handler, no extra requests for the other five
+moments, though `handleDeepLink` always reports the link it is handed); the
+SDK then asks `GET /v1/config` once and fires only for the moments the
+dashboard configured. `implicitPlacements = false` turns off implicit
+paywalls even with a handler set, but does not stop `handleDeepLink`'s
+report.
 
 ```kotlin
 val client = RevnixClient(RevnixConfig(
