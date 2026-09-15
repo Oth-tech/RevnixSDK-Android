@@ -147,12 +147,6 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_QUEUE = "revnix.pendingPurchases"
         const val KEY_CACHE_INDEX = "revnix.entIndex"
 
-        /**
-         * REV-272: how long after a FAILED config read the next moment is
-         * answered "none" without a request. An offline burst of paywall
-         * interactions then costs one probe, while a deep link opened later on
-         * good network still works.
-         */
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
         val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
@@ -700,10 +694,12 @@ public class RevnixClient(private val config: RevnixConfig) {
      *
      * This is the one implicit moment the SDK cannot see for itself — the URL
      * goes to your Activity, and an SDK intercepting it would be fighting your
-     * navigation. Does nothing unless `deeplink_open` is configured. Delivered
-     * on the first frame, while the cold-start batch is still deciding what to
-     * show, it waits for the batch and presents only if the batch showed
-     * nothing — the moment is reported either way.
+     * navigation. An ordinary link is always reported to the server so its
+     * `link.*` attribution facts land on the customer; a paywall presents
+     * only if implicit placements are on AND `deeplink_open` is configured on
+     * the dashboard. Delivered on the first frame, while the cold-start batch
+     * is still deciding what to show, it waits for the batch and presents
+     * only if the batch showed nothing — the moment is reported either way.
      *
      * A dashboard QR/link preview (`<scheme>://revnix-preview?revnix_preview=<token>`,
      * scanned or tapped) is recognised here too and is always presented —
@@ -809,11 +805,8 @@ public class RevnixClient(private val config: RevnixConfig) {
         extra: JsonObject? = null,
         present: Boolean = true,
     ): Boolean {
-        if (!implicitEnabled) return false
-        val configured = implicitConfig()
-        // The common case for five of the six in most apps: nothing attached,
-        // so nothing is sent and no ledger row is written.
-        if (placement.key !in configured) return false
+        val resolve = implicitEnabled && placement.key in implicitConfig()
+        if (!resolve && placement != RevnixImplicitPlacement.DEEPLINK_OPEN) return false
 
         val body = buildJsonObject {
             put("customerId", JsonPrimitive(customerId()))
@@ -824,6 +817,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             put("occurrenceId", JsonPrimitive(UUID.randomUUID().toString().lowercase()))
             put("occurredAt", JsonPrimitive(config.now()))
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
+            if (!resolve) put("resolve", JsonPrimitive(false))
             extra?.forEach { (k, v) -> put(k, v) }
         }
         val headers = deviceHeader?.let { mapOf("X-Revnix-Device" to it) }.orEmpty()
@@ -841,7 +835,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             val obj = json.parseToJsonElement(raw).jsonObject
             val resolved = obj["status"]?.jsonPrimitive?.contentOrNull == "ok" &&
                 obj["paywall"] != null && obj["paywall"] !is JsonNull
-            if (!resolved || !present) return false
+            if (!resolved || !present || !resolve) return false
             val resolution = decode(PlacementResolution.serializer(), raw)
             config.onImplicitPaywall?.invoke(
                 RevnixImplicitTrigger(placement = placement, resolution = resolution),

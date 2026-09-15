@@ -57,9 +57,12 @@ public data class RevnixConfig(
      * splash activity is worse than no paywall.
      *
      * Providing this handler is what TURNS IMPLICIT PLACEMENTS ON. Without it
-     * the SDK makes no extra requests at all. With it, the SDK asks
-     * `GET /v1/config` once and then fires only for the moments this app has
-     * actually configured in the dashboard.
+     * the SDK makes no extra requests for five of the six — the exception is
+     * [RevnixClient.handleDeepLink], which always reports the link it is
+     * handed regardless of this handler or the dashboard config, so the
+     * server's `link.*` attribution facts land on the customer. With this
+     * handler set, the SDK also asks `GET /v1/config` once and then fires for
+     * the moments this app has actually configured in the dashboard.
      *
      * ⚠️ Pass `trigger.resolution.placementKey` to [RevnixClient.logPaywallDisplay]
      * for the display you present. That is what tells the SDK this display came
@@ -72,7 +75,12 @@ public data class RevnixConfig(
     val onImplicitPaywall: ((RevnixImplicitTrigger) -> Unit)? = null,
     /**
      * REV-272: explicit off switch, even when [onImplicitPaywall] is set. Null
-     * means "on when a handler is present".
+     * means "on when a handler is present". Does not stop
+     * [RevnixClient.handleDeepLink] from reporting the link it is handed —
+     * that report is attribution, not a paywall moment — but off means
+     * [RevnixClient.handleDeepLink] never presents a deep-link paywall either.
+     * A dashboard preview link is the exception: it still presents regardless
+     * of this setting.
      */
     val implicitPlacements: Boolean? = null,
     /**
