@@ -211,8 +211,30 @@ val client = RevnixClient(RevnixConfig(
 ))
 
 // deeplink_open is the one moment the SDK cannot see itself:
-intent.data?.let { scope.launch { client.handleDeepLink(it.toString()) } }
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    val relaunch = savedInstanceState != null ||
+        intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+    if (!relaunch) reportDeepLink(intent)
+}
+
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    reportDeepLink(intent)
+}
+
+private fun reportDeepLink(intent: Intent) {
+    val url = intent.data ?: return
+    lifecycleScope.launch { client.handleDeepLink(url.toString()) }
+}
 ```
+
+`onCreate` is the cold start — the link launched the closed app; `onNewIntent`
+is a link arriving while the activity is already running (`singleTop` /
+`singleTask`). A rotation or process restore recreates the activity with the
+same intent, and reopening from Recents replays it — the `relaunch` check
+keeps either from counting as a second open. (`intent.data` is deliberately
+left set, not nulled out: the app's own router may still need to read it.)
 
 A dashboard QR/link preview (`<scheme>://revnix-preview?revnix_preview=<token>`)
 goes through the same `handleDeepLink` call — recognised by its own URL shape,
