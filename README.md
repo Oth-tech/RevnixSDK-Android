@@ -255,6 +255,42 @@ report one for a display that ended in a purchase. `close()` retires the
 foreground listener; `sessionTimeoutMs` (default 30 min) is the session
 boundary.
 
+### Deferred deep links
+
+A click on a Revnix link sends Android to Google Play with the query string
+as the install referrer, so `registerInstall` can come back with the link
+that install matched — exact, since it's read straight from that referrer.
+Only a link whose scheme matches the app's configured URL scheme is ever
+returned. The same link can also arrive later through the Play Install
+Referrer service: read it with
+`com.android.installreferrer:installreferrer` and hand the raw string to
+`client.handleInstallReferrer(referrer)`. Either path delivers to
+`onDeferredDeepLink` at most once per install, off the main thread:
+
+```kotlin
+val client = RevnixClient(RevnixConfig(
+    apiKey = "rvx_pk_live_…", baseUrl = "https://….convex.site",
+    storage = AndroidStorage(app),
+    onDeferredDeepLink = { url, match ->
+        mainHandler.post { router.open(url) }
+    },
+))
+
+val referrerClient = InstallReferrerClient.newBuilder(app).build()
+referrerClient.startConnection(object : InstallReferrerStateListener {
+    override fun onInstallReferrerSetupFinished(responseCode: Int) {
+        if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
+            client.handleInstallReferrer(referrerClient.installReferrer.installReferrer)
+        }
+        referrerClient.endConnection()
+    }
+    override fun onInstallReferrerServiceDisconnected() {}
+})
+```
+
+Route the URL yourself; optionally also pass it to `handleDeepLink` for
+`deeplink_open` paywall rules.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
