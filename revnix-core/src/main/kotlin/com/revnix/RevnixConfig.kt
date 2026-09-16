@@ -95,6 +95,18 @@ public data class RevnixConfig(
      * count as a new session rather than an app switch. Default 30 minutes.
      */
     val sessionTimeoutMs: Long = REVNIX_DEFAULT_SESSION_TIMEOUT_MS,
+    /**
+     * REV-299: called with the link the customer clicked before they had the
+     * app, when `POST /v1/installs` matched the install to an ad click
+     * (Android: exact, from the Play Install Referrer). The SDK calls this at
+     * most once per install.
+     * Route it yourself; you may also pass it to [RevnixClient.handleDeepLink]
+     * for `deeplink_open` paywall rules. Called off the main thread, like
+     * [onImplicitPaywall]: post to the main thread before navigating. Never
+     * throws into your app: an exception from this handler is reported through
+     * [onDiagnostic] and swallowed.
+     */
+    val onDeferredDeepLink: ((url: String, match: DeferredDeepLinkMatch) -> Unit)? = null,
 ) {
     /**
      * REV-272: the rule the client reads — [implicitPlacements] when set, else
@@ -103,3 +115,6 @@ public data class RevnixConfig(
     val implicitPlacementsEnabled: Boolean
         get() = implicitPlacements ?: (onImplicitPaywall != null)
 }
+
+/** How [RevnixConfig.onDeferredDeepLink] matched the install to a click. */
+public enum class DeferredDeepLinkMatch { EXACT, PROBABILISTIC }

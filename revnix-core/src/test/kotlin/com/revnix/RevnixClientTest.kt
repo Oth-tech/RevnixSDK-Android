@@ -103,6 +103,7 @@ class RevnixClientTest {
         device: DeviceFacts? = fixedDevice,
         onImplicitPaywall: ((RevnixImplicitTrigger) -> Unit)? = null,
         implicitPlacements: Boolean? = null,
+        onDeferredDeepLink: ((String, DeferredDeepLinkMatch) -> Unit)? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -119,6 +120,7 @@ class RevnixClientTest {
             device = device,
             onImplicitPaywall = onImplicitPaywall,
             implicitPlacements = implicitPlacements,
+            onDeferredDeepLink = onDeferredDeepLink,
         )
     ).also { clients += it }
 
@@ -966,6 +968,140 @@ class RevnixClientTest {
         assertNotNull(viewId)
         assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
+
+    private fun requestBody(request: RecordedRequest) =
+        kotlinx.serialization.json.Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+
+    @Test
+    fun `handleInstallReferrer posts the referrer verbatim, truncated at 1024`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        val client = makeClient()
+        val referrer = "utm_source=instagram&utm_medium=cpc" + "x".repeat(2000)
+
+        client.handleInstallReferrer(referrer)
+
+        val body = requestBody(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!)
+        assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
+        assertEquals(referrer.take(1024), body["installReferrer"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `handleInstallReferrer refuses a blank referrer`() = runBlocking {
+        val client = makeClient()
+        client.handleInstallReferrer("   ")
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `a deferredDeepLink on the handleInstallReferrer response fires the callback once, exact`() =
+        runBlocking {
+            route("v1/installs" to { json(200, """{"deferredDeepLink":{"url":"https://revnix.io/promo","match":"exact"}}""") })
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val seen = mutableListOf<Pair<String, DeferredDeepLinkMatch>>()
+            val client = makeClient(onDeferredDeepLink = { url, match -> seen += url to match; latch.countDown() })
+
+            client.handleInstallReferrer("utm_source=x")
+            assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+            assertEquals(listOf("https://revnix.io/promo" to DeferredDeepLinkMatch.EXACT), seen)
+        }
+
+    @Test
+    fun `a second deferredDeepLink response does not fire the callback again`() = runBlocking {
+        route("v1/installs" to { json(200, """{"deferredDeepLink":{"url":"https://revnix.io/promo","match":"exact"}}""") })
+        val storage = MemoryStorage()
+        val seen = mutableListOf<String>()
+        val latch1 = java.util.concurrent.CountDownLatch(1)
+        val client = makeClient(
+            storage = storage,
+            onDeferredDeepLink = { url, _ -> seen += url; latch1.countDown() },
+        )
+
+        client.handleInstallReferrer("utm_source=x")
+        assertTrue(latch1.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)
+
+        client.logout()
+        client.registerInstall()
+
+        assertEquals(1, seen.size)
+    }
+
+    @Test
+    fun `two concurrent handleInstallReferrer calls with a slow storage claim fire the callback once`() =
+        runBlocking {
+            route("v1/installs" to { json(200, """{"deferredDeepLink":{"url":"https://revnix.io/promo","match":"exact"}}""") })
+            val fired = java.util.concurrent.atomic.AtomicInteger(0)
+            val client = makeClient(
+                storage = SlowGetStorage("revnix.deferredDeepLinkDelivered"),
+                onDeferredDeepLink = { _, _ -> fired.incrementAndGet() },
+            )
+
+            client.handleInstallReferrer("utm_source=x")
+            client.handleInstallReferrer("utm_source=y")
+
+            server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)
+            server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)
+            kotlinx.coroutines.delay(700)
+
+            assertEquals(1, fired.get())
+        }
+
+    @Test
+    fun `a registerInstall response with a probabilistic match fires the callback`() = runBlocking {
+        route("v1/installs" to { json(200, """{"deferredDeepLink":{"url":"https://revnix.io/promo","match":"probabilistic"}}""") })
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val seen = mutableListOf<Pair<String, DeferredDeepLinkMatch>>()
+        val client = makeClient(onDeferredDeepLink = { url, match -> seen += url to match; latch.countDown() })
+
+        client.registerInstall()
+        assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+        assertEquals(listOf("https://revnix.io/promo" to DeferredDeepLinkMatch.PROBABILISTIC), seen)
+    }
+
+    @Test
+    fun `no deferredDeepLink on the response fires nothing`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        val seen = mutableListOf<String>()
+        val client = makeClient(onDeferredDeepLink = { url, _ -> seen += url })
+
+        client.registerInstall()
+
+        assertTrue(seen.isEmpty())
+    }
+
+    @Test
+    fun `a malformed deferredDeepLink body still counts registerInstall as delivered`() = runBlocking {
+        route("v1/installs" to { json(200, """{"deferredDeepLink":{"match":"exact"}}""") })
+        val diagnostics = mutableListOf<String>()
+        val seen = mutableListOf<String>()
+        val client = makeClient(
+            onDiagnostic = { diagnostics += it.op },
+            onDeferredDeepLink = { url, _ -> seen += url },
+        )
+
+        client.registerInstall()
+
+        assertTrue(seen.isEmpty())
+        assertTrue(diagnostics.isEmpty())
+    }
+
+    @Test
+    fun `a throwing onDeferredDeepLink handler is swallowed and reported`() = runBlocking {
+        route("v1/installs" to { json(200, """{"deferredDeepLink":{"url":"https://revnix.io/promo","match":"exact"}}""") })
+        val diagnostics = mutableListOf<String>()
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val client = makeClient(
+            onDiagnostic = { diagnostics += it.op; latch.countDown() },
+            onDeferredDeepLink = { _, _ -> throw IllegalStateException("boom") },
+        )
+
+        client.handleInstallReferrer("utm_source=x")
+        assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+        assertTrue(diagnostics.contains("onDeferredDeepLink"))
+    }
 }
 
 /** Mutable test clock. */
@@ -974,4 +1110,19 @@ private class TestClock(private var current: Long) {
     fun advance(ms: Long) {
         current += ms
     }
+}
+
+private class SlowGetStorage(
+    private val slowKey: String,
+    private val delayMs: Long = 200,
+    private val delegate: RevnixStorage = MemoryStorage(),
+) : RevnixStorage {
+    override fun get(key: String): String? {
+        val value = delegate.get(key)
+        if (key == slowKey) Thread.sleep(delayMs)
+        return value
+    }
+
+    override fun set(key: String, value: String) = delegate.set(key, value)
+    override fun remove(key: String) = delegate.remove(key)
 }

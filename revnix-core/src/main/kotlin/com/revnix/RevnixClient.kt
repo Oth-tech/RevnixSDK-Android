@@ -66,6 +66,8 @@ public class RevnixClient(private val config: RevnixConfig) {
     private var inflight: Deferred<CustomerEntitlements>? = null
     private var bgFailures = 0
 
+    private val deferredDeepLinkLock = Any()
+
     /**
      * REV-268: the encoded X-Revnix-Device value, built on the first resolve and
      * kept for the client's lifetime (so `firstOpen` holds for the whole first
@@ -146,6 +148,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_WALL_CLOCK = "revnix.lastWallClock"
         const val KEY_QUEUE = "revnix.pendingPurchases"
         const val KEY_CACHE_INDEX = "revnix.entIndex"
+        const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
 
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
@@ -442,12 +445,69 @@ public class RevnixClient(private val config: RevnixConfig) {
             appVersion?.let { put("appVersion", JsonPrimitive(it)) }
         }
         try {
-            request("POST", listOf("v1", "installs"), body)
+            val raw = request("POST", listOf("v1", "installs"), body)
             config.storage.set(installReportedKey(cid), "1")
+            deliverDeferredDeepLink(decodeInstallResponse(raw)?.deferredDeepLink)
         } catch (err: RevnixError) {
             bgFailures += 1
             diagnostic("registerInstall", err.message.orEmpty())
         }
+    }
+
+    /** Fire-and-forget Play Store install referrer report; safe to call late or twice. */
+    public fun handleInstallReferrer(
+        referrer: String,
+        platform: String? = null,
+        appVersion: String? = null,
+    ) {
+        if (referrer.isBlank()) return
+        scope.launch {
+            try {
+                val body = buildJsonObject {
+                    put("customerId", JsonPrimitive(customerId()))
+                    put("occurredAt", JsonPrimitive(config.now()))
+                    put("sdkVersion", JsonPrimitive(SDK_VERSION))
+                    put("installReferrer", JsonPrimitive(referrer.take(1024)))
+                    platform?.let { put("platform", JsonPrimitive(it)) }
+                    appVersion?.let { put("appVersion", JsonPrimitive(it)) }
+                }
+                val raw = request("POST", listOf("v1", "installs"), body)
+                deliverDeferredDeepLink(decodeInstallResponse(raw)?.deferredDeepLink)
+            } catch (err: Throwable) {
+                bgFailures += 1
+                diagnostic("handleInstallReferrer", err.message.orEmpty())
+            }
+        }
+    }
+
+    @Serializable
+    private data class InstallResponse(val deferredDeepLink: DeferredDeepLinkPayload? = null)
+
+    @Serializable
+    private data class DeferredDeepLinkPayload(val url: String, val match: String)
+
+    private fun decodeInstallResponse(raw: String): InstallResponse? =
+        runCatching { json.decodeFromString(InstallResponse.serializer(), raw) }.getOrNull()
+
+    private fun deliverDeferredDeepLink(link: DeferredDeepLinkPayload?) {
+        if (link == null) return
+        val handler = config.onDeferredDeepLink ?: return
+        val match = when (link.match) {
+            "exact" -> DeferredDeepLinkMatch.EXACT
+            "probabilistic" -> DeferredDeepLinkMatch.PROBABILISTIC
+            else -> return
+        }
+        val claimed = synchronized(deferredDeepLinkLock) {
+            if (config.storage.get(KEY_DEFERRED_DEEP_LINK_DELIVERED) != null) {
+                false
+            } else {
+                config.storage.set(KEY_DEFERRED_DEEP_LINK_DELIVERED, "1")
+                true
+            }
+        }
+        if (!claimed) return
+        runCatching { handler(link.url, match) }
+            .onFailure { diagnostic("onDeferredDeepLink", it.message.orEmpty()) }
     }
 
     /** Fire-and-forget impression beacon (feeds funnels + view conversions). */
