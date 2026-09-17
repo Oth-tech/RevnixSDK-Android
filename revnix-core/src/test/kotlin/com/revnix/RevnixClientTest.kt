@@ -962,6 +962,66 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `resolveDeepLink returns the server's unwrapped url and requests v1 links resolve`() = runBlocking {
+        val wrapped = "https://click.mailchimp.com/track/abc"
+        route("v1/links/resolve" to {
+            json(200, """{"url":"com.voigu.app://promo?utm_source=x","hops":2}""")
+        })
+        val client = makeClient()
+
+        val resolved = client.resolveDeepLink(wrapped)
+
+        assertEquals("com.voigu.app://promo?utm_source=x", resolved)
+        val request = server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+        assertNotNull(request)
+        assertTrue(request.path.orEmpty().startsWith("/v1/links/resolve?url="))
+        assertTrue(request.path.orEmpty().contains(java.net.URLEncoder.encode(wrapped, "UTF-8")))
+    }
+
+    @Test
+    fun `resolveDeepLink never throws, returning the input when the transport fails`() = runBlocking {
+        route("v1/links/resolve" to { disconnect() })
+        val client = makeClient()
+
+        val resolved = client.resolveDeepLink("https://click.mailchimp.com/track/abc")
+
+        assertEquals("https://click.mailchimp.com/track/abc", resolved)
+    }
+
+    @Test
+    fun `an ordinary app-scheme link and an over-length https link skip the request`() = runBlocking {
+        route("v1/links/resolve" to { json(200, """{"url":"never","hops":1}""") })
+        val client = makeClient()
+        val plain = "com.voigu.app://promo"
+        val overLong = "https://click.mailchimp.com/" + "x".repeat(1024)
+
+        assertEquals(plain, client.resolveDeepLink(plain))
+        assertEquals(overLong, client.resolveDeepLink(overLong))
+
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `a coroutine cancellation while resolving propagates rather than returning the input`() = runBlocking {
+        val cancelling = OkHttpClient.Builder()
+            .addInterceptor { throw kotlinx.coroutines.CancellationException("boom") }
+            .build()
+        val client = RevnixClient(
+            RevnixConfig(
+                apiKey = "rvx_pk_test_abc",
+                baseUrl = server.url("/").toString().trimEnd('/'),
+                storage = MemoryStorage(),
+                httpClient = cancelling,
+            )
+        ).also { clients += it }
+
+        assertFailsWith<kotlinx.coroutines.CancellationException> {
+            client.resolveDeepLink("https://click.mailchimp.com/track/abc")
+        }
+        Unit
+    }
+
+    @Test
     fun `logPaywallDisplay (logPaywallShown) with the preview key sends no request`() = runBlocking {
         val client = makeClient()
         val viewId = client.logPaywallDisplay(REVNIX_PREVIEW_PLACEMENT_KEY, "pw_preview")

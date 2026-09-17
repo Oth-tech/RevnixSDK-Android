@@ -291,6 +291,14 @@ referrerClient.startConnection(object : InstallReferrerStateListener {
 Route the URL yourself; optionally also pass it to `handleDeepLink` for
 `deeplink_open` paywall rules.
 
+An email service provider (Mailchimp, SendGrid) often rewrites a link
+through its own click-tracking domain before the customer ever taps it. Call
+`client.resolveDeepLink(url)` first to unwrap it. It returns the input
+unchanged if the server cannot resolve it, or if the input is not itself an
+http(s) URL, so the result can still be an http(s) URL when the chain could
+not be unwrapped; check its scheme before routing. Then route the result and
+hand it to `handleDeepLink`.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
