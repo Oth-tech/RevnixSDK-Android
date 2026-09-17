@@ -345,3 +345,7 @@ internal object PlacementResolutionSerializer : KSerializer<PlacementResolution>
 
 /** Swallowed background failure (queue drains, telemetry beacons). */
 public data class RevnixDiagnostic(val op: String, val message: String)
+
+/** The most recent deep link, returned by [RevnixClient.getLastDeepLink]. */
+@Serializable
+public data class LastDeepLink(val url: String, val receivedAt: Long)
