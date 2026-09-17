@@ -150,6 +150,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_QUEUE = "revnix.pendingPurchases"
         const val KEY_CACHE_INDEX = "revnix.entIndex"
         const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
+        const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
 
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
@@ -507,6 +508,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             }
         }
         if (!claimed) return
+        recordLastDeepLink(link.url)
         runCatching { handler(link.url, match) }
             .onFailure { diagnostic("onDeferredDeepLink", it.message.orEmpty()) }
     }
@@ -777,12 +779,29 @@ public class RevnixClient(private val config: RevnixConfig) {
             presentPreview(previewToken)
             return
         }
+        recordLastDeepLink(url)
         val present = launchBatch?.let { !it.await() } ?: true
         fireImplicit(
             RevnixImplicitPlacement.DEEPLINK_OPEN,
             buildJsonObject { put("url", JsonPrimitive(url.take(1024))) },
             present = present,
         )
+    }
+
+    /** Last deep link [handleDeepLink] or a delivered deferred link recorded; null when none, or the stored value is malformed. Never throws. */
+    public fun getLastDeepLink(): LastDeepLink? {
+        return runCatching {
+            config.storage.get(KEY_LAST_DEEP_LINK)?.let { json.decodeFromString(LastDeepLink.serializer(), it) }
+        }.getOrNull()
+    }
+
+    private fun recordLastDeepLink(url: String) {
+        runCatching {
+            config.storage.set(
+                KEY_LAST_DEEP_LINK,
+                json.encodeToString(LastDeepLink.serializer(), LastDeepLink(url, config.now())),
+            )
+        }
     }
 
     /**

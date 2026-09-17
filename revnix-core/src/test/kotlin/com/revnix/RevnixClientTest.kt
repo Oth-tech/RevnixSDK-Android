@@ -989,6 +989,74 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `getLastDeepLink is null before any link`() = runBlocking {
+        val client = makeClient()
+        assertNull(client.getLastDeepLink())
+    }
+
+    @Test
+    fun `handleDeepLink records the full url and receivedAt`() = runBlocking {
+        route("placements/triggered" to { json(200, paywallLegacyBody) })
+        val clock = TestClock(1_000L)
+        val client = makeClient(now = clock::now)
+
+        client.handleDeepLink("https://example.com/promo?utm_source=ig")
+
+        assertEquals(
+            LastDeepLink("https://example.com/promo?utm_source=ig", 1_000L),
+            client.getLastDeepLink(),
+        )
+    }
+
+    @Test
+    fun `a later deep link overwrites the stored one`() = runBlocking {
+        route("placements/triggered" to { json(200, paywallLegacyBody) })
+        val clock = TestClock(1_000L)
+        val client = makeClient(now = clock::now)
+
+        client.handleDeepLink("https://example.com/first")
+        clock.advance(500)
+        client.handleDeepLink("https://example.com/second")
+
+        assertEquals(
+            LastDeepLink("https://example.com/second", 1_500L),
+            client.getLastDeepLink(),
+        )
+    }
+
+    @Test
+    fun `a dashboard preview link is not recorded`() = runBlocking {
+        route("paywalls/preview/$previewToken" to { json(200, previewBodyWithoutStatusRevisionOffering) })
+        val client = makeClient(implicitPlacements = false)
+
+        client.handleDeepLink("voigu://revnix-preview?revnix_preview=$previewToken")
+
+        assertNull(client.getLastDeepLink())
+    }
+
+    @Test
+    fun `a delivered deferred link is recorded`() = runBlocking {
+        route("v1/installs" to { json(200, """{"deferredDeepLink":{"url":"https://revnix.io/promo","match":"exact"}}""") })
+        val clock = TestClock(2_000L)
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val client = makeClient(now = clock::now, onDeferredDeepLink = { _, _ -> latch.countDown() })
+
+        client.handleInstallReferrer("utm_source=x")
+        assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+        assertEquals(LastDeepLink("https://revnix.io/promo", 2_000L), client.getLastDeepLink())
+    }
+
+    @Test
+    fun `a malformed stored value returns null`() = runBlocking {
+        val storage = MemoryStorage()
+        storage.set("revnix.lastDeepLink", "not json")
+        val client = makeClient(storage = storage)
+
+        assertNull(client.getLastDeepLink())
+    }
+
+    @Test
     fun `an ordinary app-scheme link and an over-length https link skip the request`() = runBlocking {
         route("v1/links/resolve" to { json(200, """{"url":"never","hops":1}""") })
         val client = makeClient()

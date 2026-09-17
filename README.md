@@ -299,6 +299,12 @@ http(s) URL, so the result can still be an http(s) URL when the chain could
 not be unwrapped; check its scheme before routing. Then route the result and
 hand it to `handleDeepLink`.
 
+`client.getLastDeepLink()` returns the most recent link `handleDeepLink` was
+given, or a delivered deferred link, as `LastDeepLink(url, receivedAt)`; null
+if none has landed yet. Useful after a flow (login, onboarding) that swallowed
+the original delivery and needs the link back. A dashboard preview link is
+never recorded.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
