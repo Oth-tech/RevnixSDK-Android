@@ -6,6 +6,7 @@ import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -782,6 +783,32 @@ public class RevnixClient(private val config: RevnixConfig) {
             buildJsonObject { put("url", JsonPrimitive(url.take(1024))) },
             present = present,
         )
+    }
+
+    /**
+     * Unwrap a link an email service provider (Mailchimp, SendGrid, …)
+     * rewrote through its own click-tracking domain, e.g.
+     * `https://click.mailchimp.com/track/abc` back into
+     * `com.voigu.app://promo?utm_source=email&utm_campaign=summer50`. Route on
+     * the result and hand it to [handleDeepLink]; the result may still be an
+     * http(s) URL when the chain could not be unwrapped, so check its scheme
+     * before routing. On any failure, or an input the server would reject
+     * (blank, over 1024 characters, or not http/https), the input is returned
+     * unchanged with no request sent.
+     */
+    public suspend fun resolveDeepLink(url: String): String {
+        val isHttp = url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)
+        if (url.length > 1024 || !isHttp) return url
+        return try {
+            val raw = request("GET", listOf("v1", "links", "resolve"), query = mapOf("url" to url))
+            val resolved = json.parseToJsonElement(raw).jsonObject["url"]?.jsonPrimitive?.contentOrNull
+            if (resolved.isNullOrBlank()) url else resolved
+        } catch (err: Throwable) {
+            if (err is CancellationException) throw err
+            bgFailures += 1
+            diagnostic("resolveDeepLink", err.message.orEmpty())
+            url
+        }
     }
 
     private suspend fun presentPreview(token: String) {

@@ -12,6 +12,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import kotlin.random.Random
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
@@ -29,6 +30,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -352,6 +354,36 @@ public class RevnixClient(private val config: RevnixConfig) {
         } catch (err: RevnixError) {
             bgFailures += 1
             diagnostic("logPaywallShown", err.message.orEmpty())
+        }
+    }
+
+    /**
+     * Unwrap a link an email service provider (Mailchimp, SendGrid, …)
+     * rewrote through its own click-tracking domain, e.g.
+     * `https://click.mailchimp.com/track/abc` back into
+     * `com.voigu.app://promo?utm_source=email&utm_campaign=summer50`. Route on
+     * the result and hand it to your deep-link handler; the result may still
+     * be an http(s) URL when the chain could not be unwrapped, so check its
+     * scheme before routing. On any failure, or an input the server would
+     * reject (blank, over 1024 characters, or not http/https), the input is
+     * returned unchanged with no request sent.
+     */
+    public suspend fun resolveDeepLink(url: String): String {
+        val isHttp = url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)
+        if (url.length > 1024 || !isHttp) return url
+        return try {
+            val raw = request(
+                HttpMethod.Get,
+                listOf("v1", "links", "resolve"),
+                query = mapOf("url" to url),
+            )
+            val resolved = json.parseToJsonElement(raw).jsonObject["url"]?.jsonPrimitive?.contentOrNull
+            if (resolved.isNullOrBlank()) url else resolved
+        } catch (err: Throwable) {
+            if (err is CancellationException) throw err
+            bgFailures += 1
+            diagnostic("resolveDeepLink", err.message.orEmpty())
+            url
         }
     }
 
