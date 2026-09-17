@@ -792,4 +792,60 @@ class RevnixClientTest {
         assertFailsWith<RevnixError.Network> { client.entitlements() }
         client.close()
     }
+
+    @Test
+    fun resolveDeepLink_returns_the_servers_unwrapped_url_and_requests_v1_links_resolve() = runTest {
+        val wrapped = "https://click.mailchimp.com/track/abc"
+        var requestedUrl: String? = null
+        val client = RevnixClient(
+            RevnixConfig(
+                apiKey = "k",
+                baseUrl = "https://example.convex.site",
+                httpClient = HttpClient(
+                    MockEngine { request ->
+                        requestedUrl = request.url.toString()
+                        respond(
+                            """{"url":"com.voigu.app://promo?utm_source=x","hops":2}""",
+                            HttpStatusCode.OK,
+                            headersOf("Content-Type", "application/json"),
+                        )
+                    }
+                ),
+            )
+        )
+
+        val resolved = client.resolveDeepLink(wrapped)
+
+        assertEquals("com.voigu.app://promo?utm_source=x", resolved)
+        val seen = assertNotNull(requestedUrl)
+        assertTrue(seen.substringAfter("example.convex.site").startsWith("/v1/links/resolve?url="))
+        assertTrue(seen.contains("https%3A%2F%2Fclick.mailchimp.com%2Ftrack%2Fabc"))
+        client.close()
+    }
+
+    @Test
+    fun resolveDeepLink_never_throws_returning_the_input_when_the_transport_fails() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec) { _, _ -> null }
+
+        val resolved = client.resolveDeepLink("https://click.mailchimp.com/track/abc")
+
+        assertEquals("https://click.mailchimp.com/track/abc", resolved)
+        client.close()
+    }
+
+    @Test
+    fun resolveDeepLink_skips_the_request_for_an_app_scheme_link_or_an_over_length_https_link() = runTest {
+        val rec = Recorder()
+        val client = makeClient(rec) { _, _ -> ok("""{"url":"never","hops":1}""") }
+        val plain = "com.voigu.app://promo"
+        val overLong = "https://click.mailchimp.com/" + "x".repeat(1024)
+
+        assertEquals(plain, client.resolveDeepLink(plain))
+        assertEquals(overLong, client.resolveDeepLink(overLong))
+
+        assertEquals(0, rec.paths.size)
+        client.close()
+    }
+
 }
