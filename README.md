@@ -19,6 +19,15 @@ Requires Android minSdk 24 and JDK 17.
 | `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`), `AndroidStorage`, and the `RevnixPaywallView` paywall renderer. |
 | `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy (but no `setAttributes`, `logPaywallDisplay`/`logPaywallClosed`/`logPaywallEvent`, implicit placements or paywall view yet), Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
+Also public, for less common cases:
+
+- `client.reportRenderDiagnostic(message)`: report a render fallback to `onDiagnostic` when a host renders a paywall design itself instead of using `RevnixPaywallView`.
+- `RevnixLifecycleDisabled`: explicit off switch for foreground/background detection; launch-time moments still fire.
+- `RevnixImplicitPlacement.fromKey(key)`: look up one of the six implicit placements by its server key.
+- `REVNIX_DEFAULT_SESSION_TIMEOUT_MS`: the backgrounded duration that counts a return as a new session.
+- `FileStorage` (`revnix-core`): a JSON-file `RevnixStorage` implementation for non-Android JVM hosts.
+- `revnixMinorUnits(currency)`: minor units per major unit for a currency (100 for USD, 1 for JPY); divide `amountMinor` by it to get the display price.
+
 ## Install
 
 > Not yet published to Maven Central; build from source for now (see
@@ -26,7 +35,7 @@ Requires Android minSdk 24 and JDK 17.
 
 ```kotlin
 dependencies {
-    implementation("com.revnix:revnix-android:0.2.0")
+    implementation("com.revnix:revnix-android:0.3.0")
 }
 ```
 
@@ -45,15 +54,18 @@ val client = RevnixClient(
     )
 )
 
+// Any app-lifetime scope works; Revnix calls are suspend functions.
+val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
 // At app launch: connect to Play, replay owned purchases, drain the queue.
 val billing = PlayBillingConnector.start(context, client)
-client.registerInstall(platform = "android")
+appScope.launch { client.registerInstall(platform = "android") }
 
 // Buy. The connector registers the purchase and acknowledges it.
 billing.launchPurchase(activity, productDetails)
 
 // Gate. Never throws; unknown/unreachable = locked.
-if (client.isEntitled("pro")) { /* … */ }
+appScope.launch { if (client.isEntitled("pro")) { /* … */ } }
 ```
 
 Use the **publishable** key (`rvx_pk_…`) only. Secret keys must never ship in a
@@ -75,12 +87,14 @@ the variant's; render them as-is. `experiment` is attribution metadata, null
 when no running test covers the placement:
 
 ```kotlin
-val resolution = client.resolvePlacement("paywall_main")
-resolution.experiment?.let { experiment ->
-    analytics.log("paywall_shown", mapOf(
-        "experiment" to experiment.key,
-        "variant" to experiment.variantId,
-    ))
+appScope.launch {
+    val resolution = client.resolvePlacement("paywall_main")
+    resolution.experiment?.let { experiment ->
+        analytics.log("paywall_shown", mapOf(
+            "experiment" to experiment.key,
+            "variant" to experiment.variantId,
+        ))
+    }
 }
 ```
 
@@ -92,12 +106,14 @@ A test can be narrowed to an audience: conditions over customer attributes.
 `setAttributes` supplies the facts those conditions read:
 
 ```kotlin
-client.setAttributes(mapOf(
-    "country" to "US",
-    "app_version" to "4.2.0",
-    "lifetime_orders" to 3,
-    "stale_key" to null,   // null deletes the key
-))
+appScope.launch {
+    client.setAttributes(mapOf(
+        "country" to "US",
+        "app_version" to "4.2.0",
+        "lifetime_orders" to 3,
+        "stale_key" to null,   // null deletes the key
+    ))
+}
 ```
 
 Values must be `String`, `Number`, or `null`; anything else throws
@@ -258,14 +274,15 @@ boundary.
 ### Deferred deep links
 
 A click on a Revnix link sends Android to Google Play with the query string
-as the install referrer, so `registerInstall` can come back with the link
-that install matched — exact, since it's read straight from that referrer.
-Only a link whose scheme matches the app's configured URL scheme is ever
-returned. The same link can also arrive later through the Play Install
-Referrer service: read it with
+as the install referrer. Reading that referrer is how the match is made, and
+it is your call to make: read it with
 `com.android.installreferrer:installreferrer` and hand the raw string to
-`client.handleInstallReferrer(referrer)`. Either path delivers to
-`onDeferredDeepLink` at most once per install, off the main thread:
+`client.handleInstallReferrer(referrer)`. That report matches exactly, since
+the link is read straight from the referrer, and delivers to
+`onDeferredDeepLink` at most once per install, off the main thread. Only a
+link whose scheme matches the app's configured URL scheme is ever returned.
+A plain `registerInstall` call carries no referrer and returns no deferred
+link on Android. Wire both together:
 
 ```kotlin
 val client = RevnixClient(RevnixConfig(
@@ -357,8 +374,8 @@ offline-policy cache (flagged `stale`); a deliberate rejection
 ## Tests
 
 ```sh
-./gradlew :revnix-core:test     # 163 tests, the resilience matrix plus the paywall model
-./gradlew :revnix-kmp:allTests  # 39 tests, the same matrix, Ktor transport
+./gradlew :revnix-core:test     # the resilience matrix plus the paywall model
+./gradlew :revnix-kmp:allTests  # the same matrix, Ktor transport
 ```
 
 `revnix-core` runs against OkHttp's `MockWebServer`; `revnix-kmp` runs the
@@ -374,7 +391,7 @@ purchases in a sandbox app, not by either suite.
 
 ## Distribution status
 
-**Not yet published.** `com.revnix:revnix-android:0.2.0` is the intended
+**Not yet published.** `com.revnix:revnix-android:0.3.0` is the intended
 coordinate, but nothing is on Maven Central yet, so that dependency will not
 resolve. Until it ships, apps integrate over the
 [REST API](https://revnix.io/docs/rest-api), the same `/v1` contract this SDK
