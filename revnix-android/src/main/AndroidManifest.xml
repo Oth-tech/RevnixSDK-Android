@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Android 11 package visibility: without these the install referrer
+         providers answer null and AppGallery cannot be recognised as the
+         installer. -->
+    <queries>
+        <provider android:authorities="com.facebook.katana.provider.InstallReferrerProvider" />
+        <provider android:authorities="com.instagram.contentprovider.InstallReferrerProvider" />
+        <provider android:authorities="com.huawei.appmarket.commondata" />
+        <package android:name="com.huawei.appmarket" />
+    </queries>
 </manifest>
