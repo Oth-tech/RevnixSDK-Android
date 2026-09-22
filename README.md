@@ -275,14 +275,16 @@ boundary.
 
 A click on a Revnix link sends Android to Google Play with the query string
 as the install referrer. Reading that referrer is how the match is made, and
-it is your call to make: read it with
-`com.android.installreferrer:installreferrer` and hand the raw string to
-`client.handleInstallReferrer(referrer)`. That report matches exactly, since
-the link is read straight from the referrer, and delivers to
+the SDK now does it for you: call `PlayInstallReferrer.collect(context, client)`
+once at launch, next to `PlayBillingConnector.start`. It binds Play's
+`InstallReferrerClient` itself, needs no Gradle dependency or ProGuard rule
+from the host, and reports the referrer through the same
+`client.handleInstallReferrer(referrer)` path. That report matches exactly,
+since the link is read straight from the referrer, and delivers to
 `onDeferredDeepLink` at most once per install, off the main thread. Only a
 link whose scheme matches the app's configured URL scheme is ever returned.
 A plain `registerInstall` call carries no referrer and returns no deferred
-link on Android. Wire both together:
+link on Android. Wire it up:
 
 ```kotlin
 val client = RevnixClient(RevnixConfig(
@@ -293,16 +295,7 @@ val client = RevnixClient(RevnixConfig(
     },
 ))
 
-val referrerClient = InstallReferrerClient.newBuilder(app).build()
-referrerClient.startConnection(object : InstallReferrerStateListener {
-    override fun onInstallReferrerSetupFinished(responseCode: Int) {
-        if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
-            client.handleInstallReferrer(referrerClient.installReferrer.installReferrer)
-        }
-        referrerClient.endConnection()
-    }
-    override fun onInstallReferrerServiceDisconnected() {}
-})
+PlayInstallReferrer.collect(app, client)
 ```
 
 Route the URL yourself; optionally also pass it to `handleDeepLink` for
