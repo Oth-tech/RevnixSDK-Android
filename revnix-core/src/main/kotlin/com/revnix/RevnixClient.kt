@@ -456,11 +456,20 @@ public class RevnixClient(private val config: RevnixConfig) {
         }
     }
 
-    /** Fire-and-forget Play Store install referrer report; safe to call late or twice. */
+    /**
+     * Fire-and-forget install referrer report; safe to call late or twice.
+     *
+     * [source] names the store or network the referrer was read from. The
+     * server accepts exactly `play`, `huawei`, `samsung`, `xiaomi`, `vivo`,
+     * `meta` and `preinstall`, and refuses the report with a 400 on any other
+     * value. Left null, the server records no source at all — it is never
+     * assumed to be `play`.
+     */
     public fun handleInstallReferrer(
         referrer: String,
         platform: String? = null,
         appVersion: String? = null,
+        source: String? = null,
     ) {
         if (referrer.isBlank()) return
         scope.launch {
@@ -472,6 +481,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                     put("installReferrer", JsonPrimitive(referrer.take(1024)))
                     platform?.let { put("platform", JsonPrimitive(it)) }
                     appVersion?.let { put("appVersion", JsonPrimitive(it)) }
+                    source?.let { put("referrerSource", JsonPrimitive(it)) }
                 }
                 val raw = request("POST", listOf("v1", "installs"), body)
                 deliverDeferredDeepLink(decodeInstallResponse(raw)?.deferredDeepLink)

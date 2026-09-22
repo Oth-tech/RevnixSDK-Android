@@ -69,6 +69,7 @@ class PlayInstallReferrerTest {
             "utm_source=instagram&utm_medium=cpc",
             body["installReferrer"]!!.jsonPrimitive.content,
         )
+        assertEquals("play", body["referrerSource"]!!.jsonPrimitive.content)
         assertEquals("1", storage.get(keyCollected))
     }
 
@@ -129,6 +130,32 @@ class PlayInstallReferrerTest {
 
         assertEquals("1", storage.get(keyCollected))
         assertNull(server.takeRequest(200, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `onNoReferrer fires only when Play latched with nothing to post`() {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("{}"))
+        val client = makeClient()
+        var calls = 0
+
+        fun run(responseCode: Int, referrer: String?) = PlayInstallReferrer.report(
+            responseCode,
+            { referrer },
+            client,
+            MemoryStorage(),
+            keyCollected,
+            null,
+            null,
+        ) { calls += 1 }
+
+        run(InstallReferrerClient.InstallReferrerResponse.OK, "utm_source=x")
+        assertEquals(0, calls)
+        run(InstallReferrerClient.InstallReferrerResponse.SERVICE_UNAVAILABLE, null)
+        assertEquals(0, calls)
+        run(InstallReferrerClient.InstallReferrerResponse.OK, "  ")
+        assertEquals(1, calls)
+        run(InstallReferrerClient.InstallReferrerResponse.FEATURE_NOT_SUPPORTED, null)
+        assertEquals(2, calls)
     }
 
     @Test

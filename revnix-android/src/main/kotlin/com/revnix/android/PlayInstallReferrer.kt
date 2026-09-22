@@ -22,15 +22,29 @@ import com.revnix.RevnixStorage
  *
  * Never throws: a referrer that could not be read is worth another launch,
  * never a crash in the host app.
+ *
+ * Only Google Play is read here. [InstallReferrers.collect] wraps this reader
+ * with the other Android referrer sources and is what a host should call.
  */
 public object PlayInstallReferrer {
 
     // Keyed by customer the way registerInstall keys its own beacon: logout()
     // mints a new id and reports a second install, and that one has to be able
     // to carry the referrer too or it lands as organic.
-    private fun collectedKey(customerId: String) = "revnix.installReferrerCollected.$customerId"
+    internal fun collectedKey(customerId: String) = "revnix.installReferrerCollected.$customerId"
 
-    public fun collect(context: Context, client: RevnixClient, platform: String? = null) {
+    /**
+     * [onNoReferrer] runs when Play latched without posting anything — a blank
+     * referrer or no store that can answer — so a caller stacking other
+     * sources behind this one knows to move on. It does not run when the read
+     * failed transiently, because that launch has no verdict yet.
+     */
+    public fun collect(
+        context: Context,
+        client: RevnixClient,
+        platform: String? = null,
+        onNoReferrer: (() -> Unit)? = null,
+    ) {
         val storage = AndroidStorage(context)
         val key = collectedKey(client.customerId())
         if (storage.get(key) != null) return
@@ -56,6 +70,7 @@ public object PlayInstallReferrer {
                             key,
                             platform,
                             appVersion,
+                            onNoReferrer,
                         )
                     }
                     runCatching { referrer.endConnection() }
@@ -77,6 +92,7 @@ public object PlayInstallReferrer {
         key: String,
         platform: String?,
         appVersion: String?,
+        onNoReferrer: (() -> Unit)? = null,
     ) {
         when (responseCode) {
             InstallReferrerClient.InstallReferrerResponse.OK -> {
@@ -87,9 +103,8 @@ public object PlayInstallReferrer {
                 // and latches like any other.
                 val details = runCatching(readReferrer)
                 if (details.isFailure) return
-                details.getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { client.handleInstallReferrer(it, platform, appVersion) }
+                val referrer = details.getOrNull()?.takeIf { it.isNotBlank() }
+                referrer?.let { client.handleInstallReferrer(it, platform, appVersion, "play") }
                 // ponytail: latched on the attempt, not on delivery. A first
                 // launch with no network — or a client the host closed before
                 // this callback arrived, which drops the send silently — loses
@@ -98,6 +113,7 @@ public object PlayInstallReferrer {
                 // when handleInstallReferrer can report delivery, the way
                 // registerInstall already keys off a successful POST.
                 storage.set(key, "1")
+                if (referrer == null) onNoReferrer?.invoke()
             }
 
             // No Play Store that can answer: either none is installed, or the
@@ -105,8 +121,10 @@ public object PlayInstallReferrer {
             // Store that later updates itself is never re-asked, which is the
             // price of not binding a service on every launch of a device that
             // will never have one.
-            InstallReferrerClient.InstallReferrerResponse.FEATURE_NOT_SUPPORTED ->
+            InstallReferrerClient.InstallReferrerResponse.FEATURE_NOT_SUPPORTED -> {
                 storage.set(key, "1")
+                onNoReferrer?.invoke()
+            }
 
             // SERVICE_DISCONNECTED, SERVICE_UNAVAILABLE, DEVELOPER_ERROR and
             // PERMISSION_ERROR: leave the key unset so the next cold start

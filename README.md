@@ -273,14 +273,13 @@ boundary.
 
 ### Deferred deep links
 
-A click on a Revnix link sends Android to Google Play with the query string
-as the install referrer. Reading that referrer is how the match is made, and
-the SDK now does it for you: call `PlayInstallReferrer.collect(context, client)`
-once at launch, next to `PlayBillingConnector.start`. It binds Play's
-`InstallReferrerClient` itself, needs no Gradle dependency or ProGuard rule
-from the host, and reports the referrer through the same
-`client.handleInstallReferrer(referrer)` path. That report matches exactly,
-since the link is read straight from the referrer, and delivers to
+A click on a Revnix link sends Android to the store with the query string as
+the install referrer. Reading that referrer is how the match is made, and the
+SDK does it for you: call `InstallReferrers.collect(context, client)` once at
+launch, next to `PlayBillingConnector.start`. It needs no Gradle dependency or
+ProGuard rule from the host, and reports through
+`client.handleInstallReferrer(referrer, source = …)`. That report matches
+exactly, since the link is read straight from the referrer, and delivers to
 `onDeferredDeepLink` at most once per install, off the main thread. Only a
 link whose scheme matches the app's configured URL scheme is ever returned.
 A plain `registerInstall` call carries no referrer and returns no deferred
@@ -295,7 +294,36 @@ val client = RevnixClient(RevnixConfig(
     },
 ))
 
-PlayInstallReferrer.collect(app, client)
+InstallReferrers.collect(app, client, facebookAppId = "1234567890")
+```
+
+`facebookAppId` is optional; pass it and Meta's own referrer provider
+(Facebook, then Instagram) is read first. It answers only for an install a
+Meta ad actually drove, while Play answers
+`utm_source=google-play&utm_medium=organic` for every plain store install, so
+store-first would score every Meta-driven install as organic. After Meta comes
+the store — Huawei AppGallery when it installed the app, otherwise Google Play
+— and last a preinstall referrer baked into the app manifest:
+
+```xml
+<meta-data android:name="revnix_preinstall_referrer"
+    android:value="utm_source=oem&amp;utm_medium=preinstall" />
+```
+
+The first non-blank source wins, exactly one referrer is posted, and the
+result is latched per customer so later launches cost one preference read.
+`PlayInstallReferrer.collect(context, client)` is still there if you want
+Google Play and nothing else.
+
+Samsung, Xiaomi, Vivo and Huawei Ads are not read for you: each needs a
+proprietary AAR from that vendor's own Maven repo, which would break the
+Gradle build of every Play-only app. Read the string with the vendor's own SDK
+and hand it over yourself — `source` accepts `play`, `huawei`, `samsung`,
+`xiaomi`, `vivo`, `meta` and `preinstall`, and the server refuses anything
+else:
+
+```kotlin
+client.handleInstallReferrer(referrerFromSamsungSdk, source = "samsung")
 ```
 
 Route the URL yourself; optionally also pass it to `handleDeepLink` for
