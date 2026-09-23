@@ -349,3 +349,33 @@ public data class RevnixDiagnostic(val op: String, val message: String)
 /** The most recent deep link, returned by [RevnixClient.getLastDeepLink]. */
 @Serializable
 public data class LastDeepLink(val url: String, val receivedAt: Long)
+
+/**
+ * AT11: the install-attribution verdict, returned by
+ * [RevnixClient.getAttribution] and handed to [RevnixConfig.onAttribution].
+ *
+ * The server's `installMatch: "unknown"` — no install recorded yet, a normal
+ * cold-start race — never reaches a host as a value: both surface it as null
+ * instead, so "no attribution yet" has one representation, not two.
+ */
+@Serializable
+public data class RevnixAttribution(
+    /**
+     * `"referrer"`, `"click"`, `"impression"` or `"organic"`. A plain string
+     * so a verdict a newer server adds still decodes.
+     */
+    val installMatch: String,
+    /** Unix ms. */
+    val attributedAt: Long,
+    /** Unix ms — set when the customer was later re-attributed. */
+    val reattributedAt: Long? = null,
+    val linkToken: String? = null,
+    /** `play`, `huawei`, `samsung`, `xiaomi`, `vivo`, `meta`, `preinstall`. */
+    val referrerSource: String? = null,
+    val matchSignals: List<String>? = null,
+    val source: String? = null,
+    val medium: String? = null,
+    val campaign: String? = null,
+    val term: String? = null,
+    val content: String? = null,
+)

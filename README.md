@@ -343,6 +343,32 @@ if none has landed yet. Useful after a flow (login, onboarding) that swallowed
 the original delivery and needs the link back. A dashboard preview link is
 never recorded.
 
+### Install attribution
+
+`client.getAttribution()` answers how this install was attributed —
+`RevnixAttribution(installMatch, attributedAt, …)`, where `installMatch` is
+`referrer`, `click`, `impression` or `organic`, alongside the campaign fields
+(`source`, `medium`, `campaign`, `term`, `content`), the matched
+`referrerSource` and `linkToken`. It returns null when the server has not
+recorded an install yet — a normal cold-start race — or when the read fails,
+and never throws.
+
+Set `onAttribution` to be told instead of asking. It fires when the verdict
+CHANGES, so a late Play referrer or a re-attribution can fire it more than
+once; an unchanged verdict is not re-delivered. It is called off the main
+thread, and only if you set it does the SDK fetch the verdict on its own
+(after the install report and after `handleInstallReferrer`):
+
+```kotlin
+val client = RevnixClient(RevnixConfig(
+    apiKey = "rvx_pk_live_…", baseUrl = "https://….convex.site",
+    storage = AndroidStorage(app),
+    onAttribution = { attribution ->
+        analytics.setCampaign(attribution.campaign, attribution.installMatch)
+    },
+))
+```
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never
