@@ -151,6 +151,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_CACHE_INDEX = "revnix.entIndex"
         const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
         const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
+        const val KEY_ATTRIBUTION = "revnix.attribution"
 
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
@@ -449,6 +450,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         try {
             val raw = request("POST", listOf("v1", "installs"), body)
             config.storage.set(installReportedKey(cid), "1")
+            refreshAttribution()
             deliverDeferredDeepLink(decodeInstallResponse(raw)?.deferredDeepLink)
         } catch (err: RevnixError) {
             bgFailures += 1
@@ -484,6 +486,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                     source?.let { put("referrerSource", JsonPrimitive(it)) }
                 }
                 val raw = request("POST", listOf("v1", "installs"), body)
+                refreshAttribution()
                 deliverDeferredDeepLink(decodeInstallResponse(raw)?.deferredDeepLink)
             } catch (err: Throwable) {
                 bgFailures += 1
@@ -803,6 +806,52 @@ public class RevnixClient(private val config: RevnixConfig) {
         return runCatching {
             config.storage.get(KEY_LAST_DEEP_LINK)?.let { json.decodeFromString(LastDeepLink.serializer(), it) }
         }.getOrNull()
+    }
+
+    /**
+     * AT11: the install-attribution verdict for this customer — null when none
+     * has been recorded yet (a normal cold-start race, the server's
+     * `installMatch: "unknown"`) or when the read fails.
+     *
+     * Fetches fresh on every call rather than caching in memory: the point is
+     * to answer with whatever the server currently believes. A CHANGED answer
+     * also reaches [RevnixConfig.onAttribution], so a host that only wants
+     * updates need not call this at all. Never throws.
+     */
+    public suspend fun getAttribution(): RevnixAttribution? {
+        return try {
+            val raw = request("GET", listOf("v1", "customers", customerId(), "attribution"))
+            val match = runCatching {
+                json.parseToJsonElement(raw).jsonObject["installMatch"]?.jsonPrimitive?.contentOrNull
+            }.getOrNull()
+            if (match == "unknown") return null
+            val attribution = decode(RevnixAttribution.serializer(), raw)
+            deliverAttribution(attribution)
+            attribution
+        } catch (err: Throwable) {
+            if (err is CancellationException) throw err
+            bgFailures += 1
+            diagnostic("getAttribution", err.message.orEmpty())
+            null
+        }
+    }
+
+    private fun refreshAttribution() {
+        if (config.onAttribution == null) return
+        scope.launch { getAttribution() }
+    }
+
+    private fun deliverAttribution(attribution: RevnixAttribution) {
+        val serialized = json.encodeToString(RevnixAttribution.serializer(), attribution)
+        val cached = runCatching { config.storage.get(KEY_ATTRIBUTION) }
+            .onFailure { diagnostic("onAttribution", it.message.orEmpty()) }
+            .getOrNull()
+        if (cached == serialized) return
+        runCatching { config.storage.set(KEY_ATTRIBUTION, serialized) }
+            .onFailure { diagnostic("onAttribution", it.message.orEmpty()) }
+        val handler = config.onAttribution ?: return
+        runCatching { handler(attribution) }
+            .onFailure { diagnostic("onAttribution", it.message.orEmpty()) }
     }
 
     private fun recordLastDeepLink(url: String) {

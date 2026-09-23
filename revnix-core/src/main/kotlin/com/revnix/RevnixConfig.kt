@@ -107,6 +107,18 @@ public data class RevnixConfig(
      * [onDiagnostic] and swallowed.
      */
     val onDeferredDeepLink: ((url: String, match: DeferredDeepLinkMatch) -> Unit)? = null,
+    /**
+     * AT11: called whenever the install-attribution verdict CHANGES — a fresh
+     * Play referrer or a re-attribution genuinely changes the answer, so this
+     * can fire more than once across a session. Fired after the cold-start
+     * install report resolves and again after [RevnixClient.handleInstallReferrer]
+     * brings in a late signal; an unchanged verdict is not re-delivered.
+     * Call [RevnixClient.getAttribution] for the same answer on demand.
+     * Called off the main thread, like [onDeferredDeepLink]: post to the main
+     * thread before touching UI. Never throws into your app: an exception from
+     * this handler is reported through [onDiagnostic] and swallowed.
+     */
+    val onAttribution: ((RevnixAttribution) -> Unit)? = null,
 ) {
     /**
      * REV-272: the rule the client reads — [implicitPlacements] when set, else

@@ -104,6 +104,7 @@ class RevnixClientTest {
         onImplicitPaywall: ((RevnixImplicitTrigger) -> Unit)? = null,
         implicitPlacements: Boolean? = null,
         onDeferredDeepLink: ((String, DeferredDeepLinkMatch) -> Unit)? = null,
+        onAttribution: ((RevnixAttribution) -> Unit)? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -121,6 +122,7 @@ class RevnixClientTest {
             onImplicitPaywall = onImplicitPaywall,
             implicitPlacements = implicitPlacements,
             onDeferredDeepLink = onDeferredDeepLink,
+            onAttribution = onAttribution,
         )
     ).also { clients += it }
 
@@ -1229,6 +1231,127 @@ class RevnixClientTest {
         assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
 
         assertTrue(diagnostics.contains("onDeferredDeepLink"))
+    }
+
+    private val attributionBody = """
+        {"installMatch":"referrer","attributedAt":1737000000000,"linkToken":"lnk_1","referrerSource":"play","matchSignals":["referrer","device"],"source":"google","medium":"cpc","campaign":"summer","term":"pro","content":"a1"}
+    """.trimIndent()
+
+    private val reattributedBody = """
+        {"installMatch":"click","attributedAt":1737000000000,"reattributedAt":1737900000000,"source":"meta"}
+    """.trimIndent()
+
+    @Test
+    fun `getAttribution returns the parsed verdict`() = runBlocking {
+        route("attribution" to { json(200, attributionBody) })
+        val client = makeClient()
+
+        assertEquals(
+            RevnixAttribution(
+                installMatch = "referrer",
+                attributedAt = 1_737_000_000_000L,
+                linkToken = "lnk_1",
+                referrerSource = "play",
+                matchSignals = listOf("referrer", "device"),
+                source = "google",
+                medium = "cpc",
+                campaign = "summer",
+                term = "pro",
+                content = "a1",
+            ),
+            client.getAttribution(),
+        )
+    }
+
+    @Test
+    fun `an unknown verdict is null and reports nothing`() = runBlocking {
+        route("attribution" to { json(200, """{"installMatch":"unknown"}""") })
+        val diagnostics = mutableListOf<String>()
+        val client = makeClient(onDiagnostic = { diagnostics += it.op })
+
+        assertNull(client.getAttribution())
+        assertTrue(diagnostics.isEmpty())
+    }
+
+    @Test
+    fun `a failed attribution read is null and reported`() = runBlocking {
+        route("attribution" to { disconnect() })
+        val diagnostics = mutableListOf<String>()
+        val client = makeClient(onDiagnostic = { diagnostics += it.op })
+
+        assertNull(client.getAttribution())
+        assertTrue(diagnostics.contains("getAttribution"))
+    }
+
+    @Test
+    fun `onAttribution fires once for the first verdict and not for an identical one`() = runBlocking {
+        route("attribution" to { json(200, attributionBody) })
+        val seen = mutableListOf<RevnixAttribution>()
+        val client = makeClient(onAttribution = { seen += it })
+
+        client.getAttribution()
+        client.getAttribution()
+
+        assertEquals(1, seen.size)
+        assertEquals("referrer", seen.single().installMatch)
+    }
+
+    @Test
+    fun `onAttribution fires again when the verdict changes`() = runBlocking {
+        route("attribution" to onceThen(json(200, attributionBody)) { json(200, reattributedBody) })
+        val seen = mutableListOf<RevnixAttribution>()
+        val client = makeClient(onAttribution = { seen += it })
+
+        client.getAttribution()
+        client.getAttribution()
+
+        assertEquals(listOf("referrer", "click"), seen.map { it.installMatch })
+        assertEquals(1_737_900_000_000L, seen.last().reattributedAt)
+    }
+
+    @Test
+    fun `a throwing onAttribution handler is swallowed and reported`() = runBlocking {
+        route("attribution" to { json(200, attributionBody) })
+        val diagnostics = mutableListOf<String>()
+        val client = makeClient(
+            onDiagnostic = { diagnostics += it.op },
+            onAttribution = { throw IllegalStateException("boom") },
+        )
+
+        assertEquals("referrer", client.getAttribution()?.installMatch)
+        assertTrue(diagnostics.contains("onAttribution"))
+    }
+
+    @Test
+    fun `an install report fetches no attribution without a handler`() = runBlocking {
+        val fetches = AtomicInteger(0)
+        route(
+            "v1/installs" to { json(200, "{}") },
+            "attribution" to { fetches.incrementAndGet(); json(200, attributionBody) },
+        )
+        val client = makeClient()
+
+        client.registerInstall()
+        client.handleInstallReferrer("utm_source=x")
+        server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)
+
+        assertEquals(0, fetches.get())
+    }
+
+    @Test
+    fun `an install report fetches the attribution exactly once with a handler`() = runBlocking {
+        val fetches = AtomicInteger(0)
+        route(
+            "v1/installs" to { json(200, "{}") },
+            "attribution" to { fetches.incrementAndGet(); json(200, attributionBody) },
+        )
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val client = makeClient(onAttribution = { latch.countDown() })
+
+        client.registerInstall()
+        assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+        assertEquals(1, fetches.get())
     }
 }
 
