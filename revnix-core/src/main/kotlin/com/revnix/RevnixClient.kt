@@ -676,6 +676,45 @@ public class RevnixClient(private val config: RevnixConfig) {
     }
 
     /**
+     * Report impression-level ad revenue from your mediation SDK's paid-event
+     * callback (AdMob `OnPaidEventListener`, AppLovin MAX `onAdRevenuePaid`).
+     * Fire-and-forget like the other beacons: never throws.
+     */
+    public suspend fun logAdRevenue(
+        revenue: Double,
+        currency: String,
+        network: String? = null,
+        mediation: String? = null,
+        adUnit: String? = null,
+        placement: String? = null,
+        format: String? = null,
+        eventId: String? = null,
+    ) {
+        if (!revenue.isFinite() || revenue <= 0) {
+            diagnostic("logAdRevenue", "revenue must be a finite value > 0")
+            return
+        }
+        val body = buildJsonObject {
+            put("customerId", JsonPrimitive(customerId()))
+            put("revenue", JsonPrimitive(revenue))
+            put("currency", JsonPrimitive(currency.take(100)))
+            put("sdkVersion", JsonPrimitive(SDK_VERSION))
+            network?.let { put("network", JsonPrimitive(it.take(100))) }
+            mediation?.let { put("mediation", JsonPrimitive(it.take(100))) }
+            adUnit?.let { put("adUnit", JsonPrimitive(it.take(100))) }
+            placement?.let { put("placement", JsonPrimitive(it.take(100))) }
+            format?.let { put("format", JsonPrimitive(it.take(100))) }
+            eventId?.let { put("eventId", JsonPrimitive(it.take(100))) }
+        }
+        try {
+            request("POST", listOf("v1", "ad-revenue"), body)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("logAdRevenue", err.message.orEmpty())
+        }
+    }
+
+    /**
      * Set attributes on the current customer (REV-033 v2). Attributes are what
      * A/B-test audiences target — set `country`, `app_version`, `locale`, or
      * any custom key you want to segment on. A null value deletes the key.
