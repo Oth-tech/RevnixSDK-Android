@@ -17,7 +17,7 @@ Requires Android minSdk 24 and JDK 17.
 |---|---|
 | `revnix-core` | Pure JVM client: entitlements, cache policy, purchases, retry queue. No Android dependency, so the resilience matrix runs as a plain JVM test task. |
 | `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`), `AndroidStorage`, and the `RevnixPaywallView` paywall renderer. |
-| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy (but no `setAttributes`, `logPaywallDisplay`/`logPaywallClosed`/`logPaywallEvent`, implicit placements or paywall view yet), Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
+| `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy, but only entitlements, purchases and the retry queue, `resolvePlacement`, `registerInstall`, `logPaywallShown` and `resolveDeepLink`. No deep links (`handleDeepLink`, `getLastDeepLink`, deferred links), no install referrer, no attribution read-back, no ad revenue, no `setAttributes`, no paywall close or interaction events, no implicit placements and no paywall view. Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
 Also public, for less common cases:
 
@@ -176,9 +176,9 @@ paywall, the three calls are yours:
 
 | Call | What it does |
 |---|---|
-| `logPaywallDisplay(placementKey, paywallId): String` | The impression beacon, returning the `viewId` it minted. Prefer it over `logPaywallShown` whenever you intend to report the close or an interaction — that id is what pairs the halves of one display. |
+| `logPaywallDisplay(placementKey, paywallId): String` | The impression beacon, returning the `viewId` it minted. Prefer it over `logPaywallShown` whenever you intend to report the close or an interaction: that id is what pairs the halves of one display. |
 | `logPaywallClosed(viewId, placementKey, paywallId)` | Ends that display. Idempotent per view id, so a retry, a rotation or a double-dismiss cannot count two. Without it a funnel knows how many saw the paywall, not how many left without buying. |
-| `logPaywallEvent(event, viewId, …)` | One of six interactions — `Selected`, `PurchaseStarted`, `PurchaseAbandoned`, `PurchaseFailed`, `Restore`, `Error` — i.e. what happened BETWEEN the display and the close. |
+| `logPaywallEvent(event, viewId, …)` | One of six interactions (`Selected`, `PurchaseStarted`, `PurchaseAbandoned`, `PurchaseFailed`, `Restore`, `Error`), i.e. what happened BETWEEN the display and the close. |
 
 The purchase **outcome** is always yours, even with the built-in renderer:
 your app makes the Play Billing call, so only your app sees whether the sheet
@@ -201,15 +201,34 @@ client.logPaywallClosed(viewId, placementKey, paywall.paywallId)
 ```
 
 All of these are fire-and-forget: failures go to `onDiagnostic`, never to your
-call site, and all are pure ledger history — over-reporting can skew a report,
+call site, and all are pure ledger history: over-reporting can skew a report,
 never grant or revoke access.
+
+### Ad revenue
+
+Call `logAdRevenue` from AdMob's `OnPaidEventListener` or AppLovin MAX's
+`onAdRevenuePaid`:
+
+```kotlin
+client.logAdRevenue(
+    revenue = adValue.valueMicros / 1_000_000.0,
+    currency = adValue.currencyCode,
+    network = "admob",
+    format = "banner",
+)
+```
+
+It is fire-and-forget. `revenue` must be finite and > 0, otherwise nothing is
+sent. Pass `eventId` (the mediation SDK's impression id) to make retries
+idempotent. It appends `ad.revenue`, which feeds only the ROAS table on the
+Links page.
 
 ### Implicit placements
 
 Six placements resolve without a `resolvePlacement` call: `app_install`,
 `app_launch`, `session_start`, `deeplink_open`, `paywall_decline` and
 `transaction_abandon`. Passing `onImplicitPaywall` to `RevnixConfig` turns
-them on (off by default — no handler, no extra requests for the other five
+them on (off by default: no handler, no extra requests for the other five
 moments, though `handleDeepLink` always reports the link it is handed); the
 SDK then asks `GET /v1/config` once and fires only for the moments the
 dashboard configured. `implicitPlacements = false` turns off implicit
@@ -221,10 +240,10 @@ val client = RevnixClient(RevnixConfig(
     apiKey = "rvx_pk_live_…", baseUrl = "https://….convex.site",
     storage = AndroidStorage(app),
     // revnix-core has no Android dependency, so the foreground source that
-    // session_start is built on comes from revnix-android — no androidx.lifecycle.
+    // session_start is built on comes from revnix-android, no androidx.lifecycle.
     lifecycle = AndroidLifecycle(app),
     onImplicitPaywall = { trigger ->
-        // Off the main thread — post before touching views.
+        // May run on any thread: post before touching views.
         mainHandler.post { showPaywall(trigger.resolution) }
     },
 ))
@@ -248,23 +267,23 @@ private fun reportDeepLink(intent: Intent) {
 }
 ```
 
-`onCreate` is the cold start — the link launched the closed app; `onNewIntent`
+`onCreate` is the cold start (the link launched the closed app); `onNewIntent`
 is a link arriving while the activity is already running (`singleTop` /
 `singleTask`). A rotation or process restore recreates the activity with the
-same intent, and reopening from Recents replays it — the `relaunch` check
+same intent, and reopening from Recents replays it; the `relaunch` check
 keeps either from counting as a second open. (`intent.data` is deliberately
 left set, not nulled out: the app's own router may still need to read it.)
 
 A dashboard QR/link preview (`<scheme>://revnix-preview?revnix_preview=<token>`)
-goes through the same `handleDeepLink` call — recognised by its own URL shape,
-not by `deeplink_open` being configured — and is always handed to
+goes through the same `handleDeepLink` call (recognised by its own URL shape,
+not by `deeplink_open` being configured) and is always handed to
 `onImplicitPaywall`. Tell it apart from a real trigger with
 `trigger.resolution.placementKey == REVNIX_PREVIEW_PLACEMENT_KEY` /
 `trigger.resolution.preview`: `RevnixPaywallView` already refuses to invoke
 `onPurchase` for one, showing "Purchases are disabled in preview." instead,
 and no paywall analytics are sent for it.
 
-When you bind it, pass `placementKey = trigger.resolution.placementKey` —
+When you bind it, pass `placementKey = trigger.resolution.placementKey`;
 that marks the display as implicit and is what stops a `paywall_decline`
 paywall from firing `paywall_decline` again. A close is a decline: never
 report one for a display that ended in a purchase. `close()` retires the
@@ -302,8 +321,8 @@ InstallReferrers.collect(app, client, facebookAppId = "1234567890")
 Meta ad actually drove, while Play answers
 `utm_source=google-play&utm_medium=organic` for every plain store install, so
 store-first would score every Meta-driven install as organic. After Meta comes
-the store — Huawei AppGallery when it installed the app, otherwise Google Play
-— and last a preinstall referrer baked into the app manifest:
+the store (Huawei AppGallery when it installed the app, otherwise Google Play)
+and last a preinstall referrer baked into the app manifest:
 
 ```xml
 <meta-data android:name="revnix_preinstall_referrer"
@@ -318,7 +337,7 @@ Google Play and nothing else.
 Samsung, Xiaomi, Vivo and Huawei Ads are not read for you: each needs a
 proprietary AAR from that vendor's own Maven repo, which would break the
 Gradle build of every Play-only app. Read the string with the vendor's own SDK
-and hand it over yourself — `source` accepts `play`, `huawei`, `samsung`,
+and hand it over yourself. `source` accepts `play`, `huawei`, `samsung`,
 `xiaomi`, `vivo`, `meta` and `preinstall`, and the server refuses anything
 else:
 
@@ -345,12 +364,12 @@ never recorded.
 
 ### Install attribution
 
-`client.getAttribution()` answers how this install was attributed —
+`client.getAttribution()` answers how this install was attributed:
 `RevnixAttribution(installMatch, attributedAt, …)`, where `installMatch` is
 `referrer`, `click`, `impression` or `organic`, alongside the campaign fields
 (`source`, `medium`, `campaign`, `term`, `content`), the matched
 `referrerSource` and `linkToken`. It returns null when the server has not
-recorded an install yet — a normal cold-start race — or when the read fails,
+recorded an install yet (a normal cold-start race) or when the read fails,
 and never throws.
 
 Set `onAttribution` to be told instead of asking. It fires when the verdict
