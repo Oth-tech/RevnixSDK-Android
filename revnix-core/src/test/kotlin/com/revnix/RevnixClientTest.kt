@@ -1099,6 +1099,40 @@ class RevnixClientTest {
         assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
 
+    @Test
+    fun `logAdRevenue posts the beacon, and zero revenue sends nothing`() = runBlocking {
+        route("v1/ad-revenue" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.logAdRevenue(
+            revenue = 0.0032,
+            currency = "USD",
+            network = "admob",
+            mediation = "applovin_max",
+            adUnit = "banner_home",
+            placement = "home_footer",
+            format = "banner",
+            eventId = "evt_1",
+        )
+
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals("POST", request.method)
+        assertEquals("/v1/ad-revenue", request.path)
+        val body = requestBody(request)
+        assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
+        assertEquals(0.0032, body["revenue"]!!.jsonPrimitive.content.toDouble())
+        assertEquals("USD", body["currency"]!!.jsonPrimitive.content)
+        assertEquals("admob", body["network"]!!.jsonPrimitive.content)
+        assertEquals("applovin_max", body["mediation"]!!.jsonPrimitive.content)
+        assertEquals("banner_home", body["adUnit"]!!.jsonPrimitive.content)
+        assertEquals("home_footer", body["placement"]!!.jsonPrimitive.content)
+        assertEquals("banner", body["format"]!!.jsonPrimitive.content)
+        assertEquals("evt_1", body["eventId"]!!.jsonPrimitive.content)
+
+        client.logAdRevenue(revenue = 0.0, currency = "USD")
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+    }
+
     private fun requestBody(request: RecordedRequest) =
         kotlinx.serialization.json.Json.parseToJsonElement(request.body.readUtf8()).jsonObject
 
