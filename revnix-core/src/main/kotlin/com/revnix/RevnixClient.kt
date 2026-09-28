@@ -152,6 +152,8 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
         const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
         const val KEY_ATTRIBUTION = "revnix.attribution"
+        const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
+        const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
 
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
@@ -739,6 +741,7 @@ public class RevnixClient(private val config: RevnixConfig) {
      * must not have three paywalls pushed onto its first frame.
      */
     private suspend fun startImplicitPlacements() {
+        val sessionExtra = consumePreviousSessionMs()
         // Subscribed BEFORE the batch, which can take a full network timeout
         // when offline: a customer who backgrounds the app during that window
         // and comes back an hour later is a session, and missing the
@@ -763,7 +766,8 @@ public class RevnixClient(private val config: RevnixConfig) {
         val batch = scope.async {
             var presented = false
             for (placement in moments) {
-                val shown = fireImplicit(placement, present = !presented)
+                val extra = if (placement == RevnixImplicitPlacement.SESSION_START) sessionExtra else null
+                val shown = fireImplicit(placement, extra, present = !presented)
                 presented = presented || shown
             }
             presented
@@ -779,7 +783,11 @@ public class RevnixClient(private val config: RevnixConfig) {
                 // First report wins: a platform that repeats "background" (a
                 // paused Activity re-reporting) must not keep resetting the
                 // clock forward.
-                if (lastBackgroundAt == null) lastBackgroundAt = config.now()
+                if (lastBackgroundAt == null) {
+                    val now = config.now()
+                    lastBackgroundAt = now
+                    config.storage.set(KEY_LAST_BACKGROUND_AT, now.toString())
+                }
             }
             RevnixAppState.FOREGROUND -> {
                 // A foreground with no background before it is the launch
@@ -788,6 +796,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                 lastBackgroundAt = null
                 // An app switch is not a session.
                 if (config.now() - since >= config.sessionTimeoutMs) {
+                    val extra = consumePreviousSessionMs()
                     scope.launch {
                         // A new session is also when the memoised config is
                         // re-asked: the server promises an operator's change
@@ -796,7 +805,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                         // turned off — or never fire one they turned on — until
                         // the next cold start.
                         implicitMutex.withLock { implicitConfigJob = null }
-                        fireImplicit(RevnixImplicitPlacement.SESSION_START)
+                        fireImplicit(RevnixImplicitPlacement.SESSION_START, extra)
                     }
                 }
             }
@@ -995,6 +1004,19 @@ public class RevnixClient(private val config: RevnixConfig) {
             diagnostic("implicitConfig", err.message.orEmpty())
             emptySet()
         }
+    }
+
+    private fun consumePreviousSessionMs(): JsonObject? {
+        val started = config.storage.get(KEY_SESSION_STARTED_AT)?.toLongOrNull()
+        val lastBg = config.storage.get(KEY_LAST_BACKGROUND_AT)?.toLongOrNull()
+        val extra = if (started != null && lastBg != null && lastBg >= started) {
+            buildJsonObject { put("previousSessionMs", JsonPrimitive(lastBg - started)) }
+        } else {
+            null
+        }
+        config.storage.set(KEY_SESSION_STARTED_AT, config.now().toString())
+        config.storage.remove(KEY_LAST_BACKGROUND_AT)
+        return extra
     }
 
     /**
