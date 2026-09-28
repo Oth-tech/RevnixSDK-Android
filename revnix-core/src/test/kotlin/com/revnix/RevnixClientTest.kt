@@ -19,6 +19,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -105,6 +106,7 @@ class RevnixClientTest {
         implicitPlacements: Boolean? = null,
         onDeferredDeepLink: ((String, DeferredDeepLinkMatch) -> Unit)? = null,
         onAttribution: ((RevnixAttribution) -> Unit)? = null,
+        lifecycle: RevnixLifecycle? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -118,6 +120,7 @@ class RevnixClientTest {
             httpClient = OkHttpClient.Builder()
                 .callTimeout(timeout.inWholeMilliseconds, java.util.concurrent.TimeUnit.MILLISECONDS)
                 .build(),
+            lifecycle = lifecycle,
             device = device,
             onImplicitPaywall = onImplicitPaywall,
             implicitPlacements = implicitPlacements,
@@ -945,6 +948,73 @@ class RevnixClientTest {
             assertEquals(false, deepLinkBody["resolve"]!!.jsonPrimitive.content.toBoolean())
             assertTrue(seen.isEmpty())
         }
+
+    private fun fakeLifecycle(): Pair<RevnixLifecycle, () -> ((RevnixAppState) -> Unit)?> {
+        var handler: ((RevnixAppState) -> Unit)? = null
+        val lifecycle = RevnixLifecycle { h -> handler = h; { handler = null } }
+        return lifecycle to { handler }
+    }
+
+    private fun sessionStartTriggeredBodies(timeoutMs: Long = 5000) =
+        generateSequence { server.takeRequest(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            .filter { it.path.orEmpty().contains("placements/triggered") }
+            .map { kotlinx.serialization.json.Json.parseToJsonElement(it.body.readUtf8()).jsonObject }
+            .filter { it["placement"]!!.jsonPrimitive.content == "session_start" }
+            .toList()
+
+    @Test
+    fun `a session that timed out reports the previous session's wall-clock length`() = runBlocking {
+        route(
+            "v1/config" to { json(200, """{"implicitPlacements":["session_start"]}""") },
+            "placements/triggered" to { json(200, """{"status":"ok","paywall":null}""") },
+        )
+        val t0 = 1_700_000_000_000L
+        var current = t0
+        val (lifecycle, handler) = fakeLifecycle()
+        makeClient(now = { current }, lifecycle = lifecycle, onImplicitPaywall = { })
+
+        val coldStart = sessionStartTriggeredBodies(500).also {
+            assertEquals(1, it.size)
+        }
+        assertFalse(coldStart.single().containsKey("previousSessionMs"))
+
+        current = t0 + 10 * 60_000
+        handler()!!.invoke(RevnixAppState.BACKGROUND)
+        current = t0 + 41 * 60_000
+        handler()!!.invoke(RevnixAppState.FOREGROUND)
+
+        val second = sessionStartTriggeredBodies().single()
+        second["previousSessionMs"]!!.jsonPrimitive.let {
+            assertFalse(it.isString)
+            assertEquals(600_000L, it.long)
+        }
+    }
+
+    @Test
+    fun `a previous session started before a cold start still reports its length`() = runBlocking {
+        route(
+            "v1/config" to { json(200, """{"implicitPlacements":["session_start"]}""") },
+            "placements/triggered" to { json(200, """{"status":"ok","paywall":null}""") },
+        )
+        val storage = MemoryStorage()
+        val t0 = 1_700_000_000_000L
+        var current = t0
+        val (lifecycleA, handlerA) = fakeLifecycle()
+        makeClient(now = { current }, storage = storage, lifecycle = lifecycleA, onImplicitPaywall = { })
+        assertEquals(1, sessionStartTriggeredBodies(500).size)
+
+        current = t0 + 5 * 60_000
+        handlerA()!!.invoke(RevnixAppState.BACKGROUND)
+
+        current = t0 + 2 * 3600_000
+        makeClient(now = { current }, storage = storage, onImplicitPaywall = { })
+
+        val coldStartB = sessionStartTriggeredBodies().single()
+        coldStartB["previousSessionMs"]!!.jsonPrimitive.let {
+            assertFalse(it.isString)
+            assertEquals(300_000L, it.long)
+        }
+    }
 
     @Test
     fun `a 404 preview never throws and never presents`() = runBlocking {
