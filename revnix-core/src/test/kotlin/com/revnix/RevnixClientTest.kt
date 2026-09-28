@@ -1203,6 +1203,44 @@ class RevnixClientTest {
         assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
 
+    @Test
+    fun `setAttribution posts the beacon with only the set optional fields`() = runBlocking {
+        route("v1/attribution" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.setAttribution(
+            provider = "adjust",
+            network = "Facebook Installs",
+            campaign = "summer_sale",
+        )
+
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals("POST", request.method)
+        assertEquals("/v1/attribution", request.path)
+        val body = requestBody(request)
+        assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
+        assertEquals("adjust", body["provider"]!!.jsonPrimitive.content)
+        assertEquals("Facebook Installs", body["network"]!!.jsonPrimitive.content)
+        assertEquals("summer_sale", body["campaign"]!!.jsonPrimitive.content)
+        assertNull(body["adGroup"])
+        assertNull(body["creative"])
+    }
+
+    @Test
+    fun `setAttribution an identical repeat sends nothing, a changed payload sends again`() = runBlocking {
+        route("v1/attribution" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.setAttribution(provider = "adjust", network = "Facebook Installs")
+        assertEquals("POST", server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.method)
+
+        client.setAttribution(provider = "adjust", network = "Facebook Installs")
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+
+        client.setAttribution(provider = "adjust", network = "Google Installs")
+        assertEquals("POST", server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.method)
+    }
+
     private fun requestBody(request: RecordedRequest) =
         kotlinx.serialization.json.Json.parseToJsonElement(request.body.readUtf8()).jsonObject
 

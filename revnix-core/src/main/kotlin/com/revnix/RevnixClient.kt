@@ -152,6 +152,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
         const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
         const val KEY_ATTRIBUTION = "revnix.attribution"
+        const val KEY_LAST_ATTRIBUTION = "revnix.lastAttribution"
         const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
         const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
 
@@ -713,6 +714,39 @@ public class RevnixClient(private val config: RevnixConfig) {
         } catch (err: RevnixError) {
             bgFailures += 1
             diagnostic("logAdRevenue", err.message.orEmpty())
+        }
+    }
+
+    /**
+     * PT11: forward an MMP's attribution callback (Adjust, AppsFlyer, …) so
+     * Revnix credits revenue to the right network/campaign.
+     * Fire-and-forget like the other beacons: never throws.
+     */
+    public suspend fun setAttribution(
+        provider: String,
+        network: String,
+        campaign: String? = null,
+        adGroup: String? = null,
+        creative: String? = null,
+    ) {
+        val payload = listOf(provider, network, campaign.orEmpty(), adGroup.orEmpty(), creative.orEmpty())
+            .joinToString("\u0001")
+        if (config.storage.get(KEY_LAST_ATTRIBUTION) == payload) return
+        val body = buildJsonObject {
+            put("customerId", JsonPrimitive(customerId()))
+            put("provider", JsonPrimitive(provider.take(100)))
+            put("network", JsonPrimitive(network.take(100)))
+            put("sdkVersion", JsonPrimitive(SDK_VERSION))
+            campaign?.let { put("campaign", JsonPrimitive(it.take(100))) }
+            adGroup?.let { put("adGroup", JsonPrimitive(it.take(100))) }
+            creative?.let { put("creative", JsonPrimitive(it.take(100))) }
+        }
+        try {
+            request("POST", listOf("v1", "attribution"), body)
+            config.storage.set(KEY_LAST_ATTRIBUTION, payload)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("setAttribution", err.message.orEmpty())
         }
     }
 
