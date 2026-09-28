@@ -223,6 +223,39 @@ sent. Pass `eventId` (the mediation SDK's impression id) to make retries
 idempotent. It appends `ad.revenue`, which feeds only the ROAS table on the
 Links page.
 
+### MMP attribution
+
+If you already run an MMP (Adjust, AppsFlyer, Singular, Branch, Kochava,
+Tenjin, Airbridge), call `setAttribution` from its attribution callback so
+Revnix credits revenue to the right network/campaign:
+
+```kotlin
+// Adjust's attribution callback
+override fun onAttributionChanged(attribution: AdjustAttribution) {
+    client.setAttribution(
+        provider = "adjust",
+        network = attribution.network,
+        campaign = attribution.campaign,
+        adGroup = attribution.adgroup,
+        creative = attribution.creative,
+    )
+}
+
+// AppsFlyer's onConversionDataSuccess
+override fun onConversionDataSuccess(data: Map<String, Any>) {
+    if (data["af_status"] == "Organic") return
+    client.setAttribution(
+        provider = "appsflyer",
+        network = data["media_source"] as String,
+        campaign = data["campaign"] as? String,
+        adGroup = data["af_adset"] as? String,
+        creative = data["af_ad"] as? String,
+    )
+}
+```
+
+It is fire-and-forget, like `logAdRevenue`.
+
 ### Implicit placements
 
 Six placements resolve without a `resolvePlacement` call: `app_install`,
