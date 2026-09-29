@@ -450,6 +450,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
             platform?.let { put("platform", JsonPrimitive(it)) }
             appVersion?.let { put("appVersion", JsonPrimitive(it)) }
+            config.device?.deviceKey?.let { put("deviceKey", JsonPrimitive(it)) }
         }
         try {
             val raw = request("POST", listOf("v1", "installs"), body)
@@ -488,6 +489,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                     platform?.let { put("platform", JsonPrimitive(it)) }
                     appVersion?.let { put("appVersion", JsonPrimitive(it)) }
                     source?.let { put("referrerSource", JsonPrimitive(it)) }
+                    config.device?.deviceKey?.let { put("deviceKey", JsonPrimitive(it)) }
                 }
                 val raw = request("POST", listOf("v1", "installs"), body)
                 refreshAttribution()
