@@ -1241,6 +1241,31 @@ class RevnixClientTest {
         assertEquals("POST", server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.method)
     }
 
+    @Test
+    fun `setPushToken posts the beacon then an identical repeat sends nothing`() = runBlocking {
+        route("v1/push-token" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.setPushToken("abc123")
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals("POST", request.method)
+        assertEquals("/v1/push-token", request.path)
+        val body = requestBody(request)
+        assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
+        assertEquals("android", body["platform"]!!.jsonPrimitive.content)
+        assertEquals("abc123", body["token"]!!.jsonPrimitive.content)
+
+        client.setPushToken("abc123")
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+
+        client.setPushToken("def456")
+        assertEquals("POST", server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.method)
+
+        client.logout()
+        client.setPushToken("def456")
+        assertEquals("POST", server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.method)
+    }
+
     private fun requestBody(request: RecordedRequest) =
         kotlinx.serialization.json.Json.parseToJsonElement(request.body.readUtf8()).jsonObject
 

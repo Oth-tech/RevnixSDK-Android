@@ -153,6 +153,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
         const val KEY_ATTRIBUTION = "revnix.attribution"
         const val KEY_LAST_ATTRIBUTION = "revnix.lastAttribution"
+        const val KEY_LAST_PUSH_TOKEN = "revnix.lastPushToken"
         const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
         const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
 
@@ -747,6 +748,31 @@ public class RevnixClient(private val config: RevnixConfig) {
         } catch (err: RevnixError) {
             bgFailures += 1
             diagnostic("setAttribution", err.message.orEmpty())
+        }
+    }
+
+    /**
+     * Register this device's push token for uninstall measurement: Revnix
+     * sends a daily silent probe and records `app.uninstalled` when
+     * APNs/FCM report the token dead. iOS/Android only, fire-and-forget.
+     */
+    public suspend fun setPushToken(token: String) {
+        val trimmed = token.trim()
+        if (trimmed.isEmpty()) return
+        val payload = listOf(customerId(), trimmed).joinToString("\u0001")
+        if (config.storage.get(KEY_LAST_PUSH_TOKEN) == payload) return
+        val body = buildJsonObject {
+            put("customerId", JsonPrimitive(customerId()))
+            put("platform", JsonPrimitive("android"))
+            put("token", JsonPrimitive(trimmed))
+            put("sdkVersion", JsonPrimitive(SDK_VERSION))
+        }
+        try {
+            request("POST", listOf("v1", "push-token"), body)
+            config.storage.set(KEY_LAST_PUSH_TOKEN, payload)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("setPushToken", err.message.orEmpty())
         }
     }
 
