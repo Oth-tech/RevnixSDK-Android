@@ -256,6 +256,31 @@ override fun onConversionDataSuccess(data: Map<String, Any>) {
 
 It is fire-and-forget, like `logAdRevenue`.
 
+### Uninstall measurement
+
+Revnix measures uninstalls the way Adjust/AppsFlyer do: register the
+device's push token, and once a day a silent push probes it; when FCM
+reports the token dead, the customer gets an `app.uninstalled` event. Call
+it from Firebase's token callbacks:
+
+```kotlin
+class MyMessagingService : FirebaseMessagingService() {
+    override fun onNewToken(token: String) {
+        appScope.launch { client.setPushToken(token) }
+    }
+}
+
+// once at startup too, in case onNewToken doesn't fire this launch
+appScope.launch {
+    client.setPushToken(FirebaseMessaging.getInstance().token.await())
+}
+```
+
+Fire-and-forget, like `setAttribution`: never throws, dedupes per
+customer+token. Requires Firebase Cloud Messaging set up in the app; no
+notification permission needed, the probe is a silent data-only message.
+See [Uninstall measurement](https://revnix.io/docs/uninstall-measurement).
+
 ### Implicit placements
 
 Six placements resolve without a `resolvePlacement` call: `app_install`,
