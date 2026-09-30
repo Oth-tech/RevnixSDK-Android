@@ -223,6 +223,21 @@ sent. Pass `eventId` (the mediation SDK's impression id) to make retries
 idempotent. It appends `ad.revenue`, which feeds only the ROAS table on the
 Links page.
 
+### Custom events
+
+Call `track` for in-app events you want on the customer's ledger (level up,
+tutorial complete, …). It is not for purchases — those stay on
+`registerPurchase`:
+
+```kotlin
+client.track("level_up", properties = mapOf("level" to 5, "source" to "menu"))
+```
+
+It is fire-and-forget, like `logAdRevenue`. `event` must match
+`^[a-z0-9_]{1,64}$`, otherwise nothing is sent. Property values may be
+strings, numbers or booleans; anything else is dropped. Pass `eventId` to
+make retries idempotent; otherwise the SDK generates one per call.
+
 ### MMP attribution
 
 If you already run an MMP (Adjust, AppsFlyer, Singular, Branch, Kochava,
