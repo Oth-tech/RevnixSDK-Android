@@ -1204,6 +1204,40 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `track posts the beacon, and an invalid event name sends nothing`() = runBlocking {
+        route("v1/events" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.track(
+            event = "level_up",
+            properties = mapOf("level" to 5, "vip" to true, "source" to "menu"),
+            eventId = "evt_1",
+        )
+
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals("POST", request.method)
+        assertEquals("/v1/events", request.path)
+        val body = requestBody(request)
+        assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
+        assertEquals("level_up", body["event"]!!.jsonPrimitive.content)
+        assertEquals("evt_1", body["eventId"]!!.jsonPrimitive.content)
+        assertTrue(body["occurredAt"]!!.jsonPrimitive.content.toLong() > 0)
+        val properties = body["properties"]!!.jsonObject
+        assertEquals(5, properties["level"]!!.jsonPrimitive.content.toInt())
+        assertEquals(true, properties["vip"]!!.jsonPrimitive.content.toBoolean())
+        assertEquals("menu", properties["source"]!!.jsonPrimitive.content)
+
+        client.track(event = "level_up", properties = mapOf("score" to Double.NaN, "level" to 6))
+        val second = requestBody(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!)
+        assertTrue(second["eventId"]!!.jsonPrimitive.content.isNotEmpty())
+        assertNull(second["properties"]!!.jsonObject["score"])
+        assertEquals(6, second["properties"]!!.jsonObject["level"]!!.jsonPrimitive.content.toInt())
+
+        client.track(event = "Level Up")
+        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+    }
+
+    @Test
     fun `setAttribution posts the beacon with only the set optional fields`() = runBlocking {
         route("v1/attribution" to { json(200, "{}") })
         val client = makeClient()

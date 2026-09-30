@@ -160,6 +160,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
         val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
+        val TRACK_EVENT_NAME_REGEX = Regex("^[a-z0-9_]{1,64}$")
     }
 
     // MARK: - Identity
@@ -715,6 +716,49 @@ public class RevnixClient(private val config: RevnixConfig) {
         } catch (err: RevnixError) {
             bgFailures += 1
             diagnostic("logAdRevenue", err.message.orEmpty())
+        }
+    }
+
+    /**
+     * Report a custom in-app event by name, with optional flat properties.
+     * Not for purchases — those stay on [registerPurchase].
+     * Fire-and-forget like the other beacons: never throws.
+     */
+    public suspend fun track(
+        event: String,
+        properties: Map<String, Any?>? = null,
+        eventId: String? = null,
+    ) {
+        if (!TRACK_EVENT_NAME_REGEX.matches(event)) {
+            diagnostic("track", "event must match ^[a-z0-9_]{1,64}$")
+            return
+        }
+        val body = buildJsonObject {
+            put("customerId", JsonPrimitive(customerId()))
+            put("event", JsonPrimitive(event))
+            put("eventId", JsonPrimitive(eventId ?: UUID.randomUUID().toString().lowercase()))
+            put("occurredAt", JsonPrimitive(config.now()))
+            properties?.takeIf { it.isNotEmpty() }?.let { props ->
+                put(
+                    "properties",
+                    buildJsonObject {
+                        for ((key, value) in props) {
+                            when (value) {
+                                is String -> put(key, JsonPrimitive(value))
+                                is Boolean -> put(key, JsonPrimitive(value))
+                                is Number -> if (value.toDouble().isFinite()) put(key, JsonPrimitive(value))
+                                else -> Unit
+                            }
+                        }
+                    },
+                )
+            }
+        }
+        try {
+            request("POST", listOf("v1", "events"), body)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("track", err.message.orEmpty())
         }
     }
 
