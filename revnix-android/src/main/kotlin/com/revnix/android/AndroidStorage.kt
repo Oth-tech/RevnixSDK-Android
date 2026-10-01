@@ -14,11 +14,27 @@ import com.revnix.RevnixStorage
  * would mean `runBlocking` on every read, which is worse than the thing
  * DataStore exists to avoid. Values here are small: ids, one entitlement
  * snapshot per recent customer, and the pending-purchase queue.
+ *
+ * Android's Auto Backup can restore this file onto a fresh install.
  */
 public class AndroidStorage(context: Context) : RevnixStorage {
 
     private val prefs: SharedPreferences = context.applicationContext
         .getSharedPreferences("com.revnix.storage", Context.MODE_PRIVATE)
+
+    init {
+        val app = context.applicationContext
+        val firstInstallTime = runCatching {
+            app.packageManager.getPackageInfo(app.packageName, 0).firstInstallTime
+        }.getOrNull()
+        if (firstInstallTime != null) {
+            val stored = prefs.getLong(KEY_FIRST_INSTALL_TIME, -1L)
+            if (stored != -1L && stored != firstInstallTime) {
+                prefs.edit().clear().commit()
+            }
+            prefs.edit().putLong(KEY_FIRST_INSTALL_TIME, firstInstallTime).apply()
+        }
+    }
 
     override fun get(key: String): String? = prefs.getString(key, null)
 
@@ -28,5 +44,9 @@ public class AndroidStorage(context: Context) : RevnixStorage {
 
     override fun remove(key: String) {
         prefs.edit().remove(key).apply()
+    }
+
+    private companion object {
+        const val KEY_FIRST_INSTALL_TIME = "revnix.firstInstallTime"
     }
 }

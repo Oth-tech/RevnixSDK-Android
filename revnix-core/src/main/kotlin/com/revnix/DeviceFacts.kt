@@ -42,6 +42,9 @@ public data class DeviceFacts(
     val model: String? = null,
     /** True for a debuggable build. */
     val sandbox: Boolean? = null,
+    /** Opaque hash that survives an uninstall/reinstall, for reinstall detection.
+     *  Sent on `/v1/installs` only — never in the per-resolve device header. */
+    val deviceKey: String? = null,
 ) {
     /** These facts with every non-null field of [over] winning. */
     public fun overriddenBy(over: DeviceFacts?): DeviceFacts {
@@ -55,6 +58,7 @@ public data class DeviceFacts(
             storefront = over.storefront ?: storefront,
             model = over.model ?: model,
             sandbox = over.sandbox ?: sandbox,
+            deviceKey = over.deviceKey ?: deviceKey,
         )
     }
 

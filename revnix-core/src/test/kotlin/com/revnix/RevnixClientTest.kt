@@ -538,6 +538,53 @@ class RevnixClientTest {
         assertNull(server.takeRequest().getHeader("X-Revnix-Device"))
     }
 
+    // MARK: - Reinstall handling (MS2)
+
+    @Test
+    fun `registerInstall carries deviceKey in the body but never in the X-Revnix-Device header`() = runBlocking {
+        route(
+            "/placements" to { json(200, placementBody) },
+            "v1/installs" to { json(200, "{}") },
+        )
+        val client = makeClient(device = fixedDevice.copy(deviceKey = "dk_test"))
+
+        client.resolvePlacement("main")
+        val header = decodeDeviceHeader(server.takeRequest().getHeader("X-Revnix-Device")!!)
+        assertNull(header["deviceKey"])
+
+        client.registerInstall()
+        val installBody = requestBody(server.takeRequest())
+        assertEquals("dk_test", installBody["deviceKey"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `registerInstall omits deviceKey when the device facts have none`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        val client = makeClient(device = fixedDevice)
+        client.registerInstall()
+        val body = requestBody(server.takeRequest())
+        assertNull(body["deviceKey"])
+    }
+
+    @Test
+    fun `handleInstallReferrer also carries deviceKey`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        val client = makeClient(device = fixedDevice.copy(deviceKey = "dk_test"))
+        client.handleInstallReferrer("utm_source=x")
+        val body = requestBody(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!)
+        assertEquals("dk_test", body["deviceKey"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `overriddenBy keeps deviceKey when the override has none, and overrides it when set`() {
+        val base = fixedDevice.copy(deviceKey = "dk_base")
+        val unchanged = base.overriddenBy(DeviceFacts(platform = "android"))
+        assertEquals("dk_base", unchanged.deviceKey)
+
+        val overridden = base.overriddenBy(DeviceFacts(deviceKey = "dk_override"))
+        assertEquals("dk_override", overridden.deviceKey)
+    }
+
     @Test
     fun `detect answers from the running JVM`() {
         val facts = DeviceFacts.detect()

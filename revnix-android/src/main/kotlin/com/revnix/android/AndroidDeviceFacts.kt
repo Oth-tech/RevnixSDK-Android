@@ -3,7 +3,9 @@ package com.revnix.android
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.os.Build
+import android.provider.Settings
 import com.revnix.DeviceFacts
+import java.security.MessageDigest
 
 /**
  * REV-268: the device facts an Android app can report with a `Context` in
@@ -32,7 +34,16 @@ public object AndroidDeviceFacts {
                 appVersion = versionName?.takeIf { it.isNotBlank() },
                 model = Build.MODEL?.takeIf { it.isNotBlank() },
                 sandbox = debuggable,
+                deviceKey = deviceKey(app),
             )
         )
     }
+
+    private fun deviceKey(context: Context): String? = runCatching {
+        val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+        // 9774d56d682e549c: Android's documented fallback ANDROID_ID on broken/emulator devices.
+        if (androidId.isNullOrBlank() || androidId == "9774d56d682e549c") return@runCatching null
+        val digest = MessageDigest.getInstance("SHA-256").digest("revnix:$androidId".toByteArray(Charsets.UTF_8))
+        digest.joinToString("") { "%02x".format(it) }
+    }.getOrNull()
 }
