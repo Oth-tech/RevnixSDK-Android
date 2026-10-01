@@ -1055,7 +1055,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         if (!author.isNullOrEmpty()) {
             val lp = LinearLayout.LayoutParams(WRAP, WRAP)
             lp.topMargin = dp(6)
-            card.addView(text("— $author", 12f, ctx.theme.textSecondary), lp)
+            card.addView(text(author, 12f, ctx.theme.textSecondary), lp)
         }
         column.addBlock(card, bottom = 22)
     }
