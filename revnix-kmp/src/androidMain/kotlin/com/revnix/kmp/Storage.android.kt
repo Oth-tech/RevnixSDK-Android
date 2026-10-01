@@ -9,7 +9,7 @@ public actual fun defaultStorage(namespace: String): RevnixStorage {
     val context = RevnixAndroid.applicationContext
         ?: error(
             "Call RevnixAndroid.init(context) before defaultStorage(), or pass " +
-                "an explicit AndroidStorage — Android has no ambient context."
+                "an explicit AndroidStorage. Android has no ambient context."
         )
     return AndroidStorage(context, namespace)
 }
