@@ -138,29 +138,38 @@ public class RevnixClient(private val config: RevnixConfig) {
         }
     }
 
-    private companion object {
-        const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
-        const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
-        const val CACHE_CUSTOMERS = 4
-        const val SDK_VERSION = "0.3.0"
+    public companion object {
+        private const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
+        private const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
+        private const val CACHE_CUSTOMERS = 4
+        private const val SDK_VERSION = "0.3.0"
 
-        const val KEY_CUSTOMER_ID = "revnix.customerId"
-        const val KEY_INSTALLED_AT = "revnix.installedAt"
-        const val KEY_WALL_CLOCK = "revnix.lastWallClock"
-        const val KEY_QUEUE = "revnix.pendingPurchases"
-        const val KEY_CACHE_INDEX = "revnix.entIndex"
-        const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
-        const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
-        const val KEY_ATTRIBUTION = "revnix.attribution"
-        const val KEY_LAST_ATTRIBUTION = "revnix.lastAttribution"
-        const val KEY_LAST_PUSH_TOKEN = "revnix.lastPushToken"
-        const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
-        const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
+        private const val KEY_CUSTOMER_ID = "revnix.customerId"
+        private const val KEY_INSTALLED_AT = "revnix.installedAt"
+        private const val KEY_WALL_CLOCK = "revnix.lastWallClock"
+        private const val KEY_QUEUE = "revnix.pendingPurchases"
+        private const val KEY_CACHE_INDEX = "revnix.entIndex"
+        private const val KEY_DEFERRED_DEEP_LINK_DELIVERED = "revnix.deferredDeepLinkDelivered"
+        private const val KEY_LAST_DEEP_LINK = "revnix.lastDeepLink"
+        private const val KEY_ATTRIBUTION = "revnix.attribution"
+        private const val KEY_LAST_ATTRIBUTION = "revnix.lastAttribution"
+        private const val KEY_LAST_PUSH_TOKEN = "revnix.lastPushToken"
+        private const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
+        private const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
 
-        const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
+        private const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
 
-        val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
-        val TRACK_EVENT_NAME_REGEX = Regex("^[a-z0-9_]{1,64}$")
+        private val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
+        private val TRACK_EVENT_NAME_REGEX = Regex("^[a-z0-9_]{1,64}$")
+
+        /**
+         * Forces every paywall rendered after this call to [tag]'s language
+         * instead of the device's. Null or empty clears the override.
+         */
+        @JvmStatic
+        public fun setLocale(tag: String?) {
+            revnixSetLocaleOverride(tag?.takeIf { it.isNotEmpty() })
+        }
     }
 
     // MARK: - Identity

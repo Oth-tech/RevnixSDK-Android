@@ -19,7 +19,8 @@ import kotlinx.serialization.json.JsonPrimitive
  * chain and the field list identical.
  */
 public data class PaywallLocalization(
-    /** The language the tree's own copy is written in. Never a key in [tables]. */
+    /** The language the tree's own copy is written in; a localized copy names
+     *  the language it was localized to. Never a key in a parsed doc's [tables]. */
     public val defaultLocale: String? = null,
     /** BCP-47 tag → (`<blockId>.<path>` → translated string). */
     public val tables: Map<String, Map<String, String>> = emptyMap(),
@@ -95,13 +96,22 @@ public fun revnixNormalizeLocale(tag: String?): String? {
     return (listOf(language) + rest).joinToString("-")
 }
 
+@Volatile
+private var localeOverride: String? = null
+
+internal fun revnixSetLocaleOverride(tag: String?) {
+    localeOverride = tag
+}
+
 /**
  * The device's language as a BCP-47 tag. `Locale.getDefault()` is what every
  * other surface in the app localizes to — including the per-app language an
  * Android 13+ user can pick — so a paywall matching it matches the app.
  */
-public fun revnixDeviceLocale(): String? =
-    runCatching { java.util.Locale.getDefault().toLanguageTag() }.getOrNull()
+public fun revnixDeviceLocale(): String? {
+    localeOverride?.let { return it }
+    return runCatching { java.util.Locale.getDefault().toLanguageTag() }.getOrNull()
+}
 
 private fun Char.isAsciiLetter(): Boolean = this in 'a'..'z' || this in 'A'..'Z'
 
@@ -190,5 +200,82 @@ public fun PaywallBlockDoc.localized(locale: String?): PaywallBlockDoc {
         chain.firstNotNullOfOrNull { tag -> tables[tag]?.get(key)?.takeIf { it.isNotEmpty() } }
             ?: authored
     }
-    return copy(blocks = blocks.map { localizeBlock(it, lookup) })
+    return copy(
+        localization = localization.copy(defaultLocale = chain[0]),
+        blocks = blocks.map { localizeBlock(it, lookup) },
+    )
+}
+
+private val LINK_LABEL_ALIASES: Map<String, String> = mapOf(
+    "iw" to "he", "in" to "id", "no" to "nb", "tl" to "fil",
+)
+
+private val LINK_LABELS: Map<String, Triple<String, String, String>> = mapOf(
+    "ar" to Triple("استعادة", "الشروط", "الخصوصية"),
+    "bg" to Triple("Възстановяване", "Условия", "Поверителност"),
+    "bn" to Triple("পুনরুদ্ধার", "শর্তাবলী", "গোপনীয়তা"),
+    "ca" to Triple("Restaura", "Condicions", "Privadesa"),
+    "cs" to Triple("Obnovit", "Podmínky", "Soukromí"),
+    "da" to Triple("Gendan", "Vilkår", "Privatliv"),
+    "de" to Triple("Wiederherstellen", "AGB", "Datenschutz"),
+    "el" to Triple("Επαναφορά", "Όροι", "Απόρρητο"),
+    "en" to Triple("Restore", "Terms", "Privacy"),
+    "es" to Triple("Restaurar", "Términos", "Privacidad"),
+    "et" to Triple("Taasta", "Tingimused", "Privaatsus"),
+    "fa" to Triple("بازیابی", "شرایط", "حریم خصوصی"),
+    "fi" to Triple("Palauta", "Ehdot", "Tietosuoja"),
+    "fil" to Triple("I-restore", "Mga Tuntunin", "Privacy"),
+    "fr" to Triple("Restaurer", "Conditions", "Confidentialité"),
+    "he" to Triple("שחזור", "תנאים", "פרטיות"),
+    "hi" to Triple("पुनर्स्थापित करें", "शर्तें", "गोपनीयता"),
+    "hr" to Triple("Vrati", "Uvjeti", "Privatnost"),
+    "hu" to Triple("Visszaállítás", "Feltételek", "Adatvédelem"),
+    "id" to Triple("Pulihkan", "Ketentuan", "Privasi"),
+    "it" to Triple("Ripristina", "Termini", "Privacy"),
+    "ja" to Triple("購入を復元", "利用規約", "プライバシー"),
+    "ko" to Triple("구매 복원", "이용약관", "개인정보"),
+    "lt" to Triple("Atkurti", "Sąlygos", "Privatumas"),
+    "lv" to Triple("Atjaunot", "Noteikumi", "Privātums"),
+    "ms" to Triple("Pulihkan", "Terma", "Privasi"),
+    "nb" to Triple("Gjenopprett", "Vilkår", "Personvern"),
+    "nl" to Triple("Herstellen", "Voorwaarden", "Privacy"),
+    "pl" to Triple("Przywróć", "Regulamin", "Prywatność"),
+    "pt" to Triple("Restaurar", "Termos", "Privacidade"),
+    "ro" to Triple("Restaurează", "Termeni", "Confidențialitate"),
+    "ru" to Triple("Восстановить", "Условия", "Конфиденциальность"),
+    "sk" to Triple("Obnoviť", "Podmienky", "Súkromie"),
+    "sl" to Triple("Obnovi", "Pogoji", "Zasebnost"),
+    "sr" to Triple("Врати", "Услови", "Приватност"),
+    "sv" to Triple("Återställ", "Villkor", "Integritet"),
+    "th" to Triple("กู้คืน", "ข้อกำหนด", "ความเป็นส่วนตัว"),
+    "tr" to Triple("Geri Yükle", "Koşullar", "Gizlilik"),
+    "uk" to Triple("Відновити", "Умови", "Конфіденційність"),
+    "ur" to Triple("بحال کریں", "شرائط", "رازداری"),
+    "vi" to Triple("Khôi phục", "Điều khoản", "Quyền riêng tư"),
+    "zh" to Triple("恢复购买", "条款", "隐私"),
+    "zh-Hant" to Triple("恢復購買", "條款", "隱私"),
+)
+
+/**
+ * The three built-in paywall footer labels (restore, terms, privacy), in the
+ * language [locale] resolves to. Falls back to English for any language not
+ * in the 43-entry table. Mandarin picks traditional script for Taiwan, Hong
+ * Kong and Macau unless the tag is explicitly simplified.
+ */
+public fun revnixLinkLabels(locale: String?): Triple<String, String, String> =
+    LINK_LABELS[resolveLinkLabelTag(locale)] ?: LINK_LABELS["en"]!!
+
+private fun resolveLinkLabelTag(locale: String?): String {
+    val tag = revnixNormalizeLocale(locale) ?: return "en"
+    val lang = baseLanguage(tag)
+    if (lang == "zh") {
+        val parts = tag.split("-").drop(1)
+        val hasHant = parts.contains("Hant")
+        val hasHans = parts.contains("Hans")
+        val region = parts.firstOrNull { it.length == 2 && it.all { c -> c in 'A'..'Z' } }
+        val isTraditionalRegion = region != null && region in setOf("TW", "HK", "MO")
+        return if (hasHant || (!hasHans && isTraditionalRegion)) "zh-Hant" else "zh"
+    }
+    val base = LINK_LABEL_ALIASES[lang] ?: lang
+    return if (base in LINK_LABELS) base else "en"
 }

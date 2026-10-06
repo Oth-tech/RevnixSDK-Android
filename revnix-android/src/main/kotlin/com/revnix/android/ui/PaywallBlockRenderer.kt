@@ -63,6 +63,7 @@ import com.revnix.BlockStyle
 import com.revnix.PaywallBlock
 import com.revnix.PaywallBlockDoc
 import com.revnix.revnixIsConvex
+import com.revnix.revnixLinkLabels
 import com.revnix.revnixParsePolygon
 import com.revnix.revnixParseTranslate
 import com.revnix.RevnixBackgroundLayers
@@ -612,15 +613,16 @@ internal class PaywallBlockRenderer(
     private fun linksRow(block: PaywallBlock.Links, style: BlockStyle?): View? {
         // An explicit host handler wins over the config URL — the app knows
         // best how to open its own legal pages; the URL is the fallback.
+        val labels = revnixLinkLabels(ctx.doc.localization.defaultLocale)
         val entries = buildList {
-            if (block.showRestore != false) add("Restore" to { ctx.onRestore?.invoke(); Unit })
+            if (block.showRestore != false) add(labels.first to { ctx.onRestore?.invoke(); Unit })
             if (block.showTerms != false) {
                 val url = block.termsUrl ?: ctx.footerTermsUrl
-                add("Terms" to { open(ctx.onTerms, url) })
+                add(labels.second to { open(ctx.onTerms, url) })
             }
             if (block.showPrivacy != false) {
                 val url = block.privacyUrl ?: ctx.footerPrivacyUrl
-                add("Privacy" to { open(ctx.onPrivacy, url) })
+                add(labels.third to { open(ctx.onPrivacy, url) })
             }
         }
         if (entries.isEmpty()) return null

@@ -1,5 +1,6 @@
 package com.revnix
 
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -133,5 +134,54 @@ class PaywallLocalizationTest {
         val parsed = doc(broken)
         assertTrue(parsed.localization.isEmpty)
         assertEquals("Unlock Pro", assertIs<PaywallBlock.Text>(parsed.localized("es").blocks[0]).text)
+    }
+
+    @AfterTest
+    fun resetLocaleOverride() {
+        revnixSetLocaleOverride(null)
+    }
+
+    @Test
+    fun `localized sets defaultLocale to the chain's winner`() {
+        val withTable = """
+            {"version":1,"background":"#000","textColor":"#fff","accent":"#6478ff",
+             "accentInk":"#fff","locales":{"es":{"hed.text":"Hola"}},
+             "blocks":[{"id":"hed","type":"text","text":"Hi"}]}
+        """
+        assertEquals("es", doc(withTable).localized("es-MX").localization.defaultLocale)
+    }
+
+    @Test
+    fun `link labels resolve regional and script variants`() {
+        assertEquals(Triple("بحال کریں", "شرائط", "رازداری"), revnixLinkLabels("ur"))
+        assertEquals(Triple("بحال کریں", "شرائط", "رازداری"), revnixLinkLabels("ur-PK"))
+
+        val traditional = Triple("恢復購買", "條款", "隱私")
+        assertEquals(traditional, revnixLinkLabels("zh-Hant-TW"))
+        assertEquals(traditional, revnixLinkLabels("zh-TW"))
+        assertEquals(traditional, revnixLinkLabels("zh-HK"))
+
+        val simplified = Triple("恢复购买", "条款", "隐私")
+        assertEquals(simplified, revnixLinkLabels("zh-Hans-HK"))
+        assertEquals(simplified, revnixLinkLabels("zh-CN"))
+        assertEquals(simplified, revnixLinkLabels("zh"))
+
+        assertEquals(Triple("שחזור", "תנאים", "פרטיות"), revnixLinkLabels("iw"))
+        assertEquals(Triple("Gjenopprett", "Vilkår", "Personvern"), revnixLinkLabels("no"))
+
+        val english = Triple("Restore", "Terms", "Privacy")
+        assertEquals(english, revnixLinkLabels("xx"))
+        assertEquals(english, revnixLinkLabels(null))
+        assertEquals(english, revnixLinkLabels(""))
+
+        assertEquals(Triple("Restaurar", "Termos", "Privacidade"), revnixLinkLabels("pt_BR"))
+    }
+
+    @Test
+    fun `setLocale overrides the device locale until cleared`() {
+        revnixSetLocaleOverride("ur")
+        assertEquals("ur", revnixDeviceLocale())
+        revnixSetLocaleOverride(null)
+        assertNotNull(revnixDeviceLocale())
     }
 }
