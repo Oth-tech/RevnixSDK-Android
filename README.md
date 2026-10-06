@@ -16,7 +16,7 @@ Requires Android minSdk 24 and JDK 17.
 | Module | What it is |
 |---|---|
 | `revnix-core` | Pure JVM client: entitlements, cache policy, purchases, retry queue. No Android dependency, so the resilience matrix runs as a plain JVM test task. |
-| `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`), `AndroidStorage`, and the `RevnixPaywallView` paywall renderer. |
+| `revnix-android` | Play Billing 8 glue (`PlayBillingConnector`), install referrer readers (`InstallReferrers`, `PlayInstallReferrer`), `AndroidStorage`, `AndroidLifecycle`, `AndroidDeviceFacts` (app version, debuggable flag, reinstall `deviceKey`), and the `RevnixPaywallView` renderer. |
 | `revnix-kmp` | Kotlin Multiplatform build of the same client: identical resilience policy, but only entitlements, purchases and the retry queue, `resolvePlacement`, `registerInstall`, `logPaywallShown` and `resolveDeepLink`. No deep links (`handleDeepLink`, `getLastDeepLink`, deferred links), no install referrer, no attribution read-back, no ad revenue, no `setAttributes`, no paywall close or interaction events, no implicit placements and no paywall view. Ktor transport instead of OkHttp. Targets `jvm`, `androidTarget`, `iosX64`, `iosArm64`, `iosSimulatorArm64`. Use it from a shared KMP module; use `revnix-core` + `revnix-android` from an Android-only app. |
 
 Also public, for less common cases:
@@ -49,7 +49,8 @@ val client = RevnixClient(
         storage = AndroidStorage(context),
         // Device facts sent with every placement resolve (REV-268): platform,
         // OS version and model are detected by default; this adds the app
-        // version and debuggable flag. Pass null to send nothing.
+        // version, debuggable flag and the deviceKey reinstall detection
+        // needs. Pass null to send nothing.
         device = AndroidDeviceFacts.detect(context),
     )
 )
@@ -167,7 +168,9 @@ Terms/Privacy links prefer your `onTerms`/`onPrivacy` handlers and fall back
 to opening the config's URLs. Pass `onClose` to draw a close button: the view
 calls you, you perform the dismissal, and with `client` set it reports
 `paywall.closed`. The `locale` property picks a designed paywall's language
-(default: the device's).
+(default: the device's); `RevnixClient.setLocale(tag)` (`null` clears it)
+forces that language for every paywall rendered after the call app-wide, but
+the view's own `locale` still wins for that view.
 
 ### Reporting a display you render yourself
 
@@ -226,7 +229,7 @@ Links page.
 ### Custom events
 
 Call `track` for in-app events you want on the customer's ledger (level up,
-tutorial complete, …). It is not for purchases — those stay on
+tutorial complete, …). It is not for purchases: those stay on
 `registerPurchase`:
 
 ```kotlin
@@ -247,25 +250,29 @@ Revnix credits revenue to the right network/campaign:
 ```kotlin
 // Adjust's attribution callback
 override fun onAttributionChanged(attribution: AdjustAttribution) {
-    client.setAttribution(
-        provider = "adjust",
-        network = attribution.network,
-        campaign = attribution.campaign,
-        adGroup = attribution.adgroup,
-        creative = attribution.creative,
-    )
+    appScope.launch {
+        client.setAttribution(
+            provider = "adjust",
+            network = attribution.network,
+            campaign = attribution.campaign,
+            adGroup = attribution.adgroup,
+            creative = attribution.creative,
+        )
+    }
 }
 
 // AppsFlyer's onConversionDataSuccess
 override fun onConversionDataSuccess(data: Map<String, Any>) {
     if (data["af_status"] == "Organic") return
-    client.setAttribution(
-        provider = "appsflyer",
-        network = data["media_source"] as String,
-        campaign = data["campaign"] as? String,
-        adGroup = data["af_adset"] as? String,
-        creative = data["af_ad"] as? String,
-    )
+    appScope.launch {
+        client.setAttribution(
+            provider = "appsflyer",
+            network = data["media_source"] as String,
+            campaign = data["campaign"] as? String,
+            adGroup = data["af_adset"] as? String,
+            creative = data["af_ad"] as? String,
+        )
+    }
 }
 ```
 
@@ -477,9 +484,13 @@ identifier; the token is the stable key the backend dedupes on.
 `obfuscatedAccountId` is set to the Revnix customer id on the billing flow, so
 server-to-server RTDN self-identifies.
 
-Google device claims cannot carry store-side proof, so expect
-`provisional = true` on store-connected tenants until the server corroborates
-via RTDN / `subscriptionsv2.get`. It is surfaced on `RegisterPurchaseResult`.
+When Google Play is connected, the server checks the `purchaseToken` with
+Play during registration, so the claim is store-verified and `provisional`
+stays `false`. Only if Play cannot be reached at that moment is the claim
+recorded `provisional = true` until the server corroborates it via RTDN /
+`subscriptionsv2.get`. A token Play rejects, or one for a different product,
+is refused with a 403 and left unacknowledged. `provisional` is surfaced on
+`RegisterPurchaseResult`.
 
 ## Resilience policy
 
@@ -501,9 +512,10 @@ agreement with it and with the Swift port.
 | Retry / poll delays | ±20% jitter; `Retry-After` honored |
 | Swallowed background failures | `onDiagnostic` callback; count rides `X-Revnix-Bg-Failures` |
 
-`waitForEntitlements(seq)` bypasses the soft TTL (the point of that poll is a
-fresh ledger cursor), and resolves with the last read rather than throwing if
-the ledger never catches up.
+`waitForEntitlements(seq)` reads entitlements (the first read may come from
+the soft TTL snapshot); the polls after that first read bypass the soft TTL
+(the point of a poll is a fresh ledger cursor), and resolve with the last
+read rather than throwing if the ledger never catches up.
 
 `isEntitled` never throws: on a transient failure `entitlements()` serves the
 offline-policy cache (flagged `stale`); a deliberate rejection
