@@ -2,6 +2,8 @@ package com.revnix
 
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -18,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
@@ -26,6 +29,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
@@ -68,6 +72,10 @@ public class RevnixClient(private val config: RevnixConfig) {
     private var bgFailures = 0
 
     private val deferredDeepLinkLock = Any()
+
+    private val integrityMutex = Mutex()
+    private var integrityDeferred: Deferred<String?>? = null
+    private var integrityDeferredCid: String? = null
 
     /**
      * REV-268: the encoded X-Revnix-Device value, built on the first resolve and
@@ -461,6 +469,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             platform?.let { put("platform", JsonPrimitive(it)) }
             appVersion?.let { put("appVersion", JsonPrimitive(it)) }
             config.device?.deviceKey?.let { put("deviceKey", JsonPrimitive(it)) }
+            putIntegrity(cid)
         }
         try {
             val raw = request("POST", listOf("v1", "installs"), body)
@@ -471,6 +480,44 @@ public class RevnixClient(private val config: RevnixConfig) {
             bgFailures += 1
             diagnostic("registerInstall", err.message.orEmpty())
         }
+    }
+
+    internal fun integrityNonce(customerId: String): String =
+        Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(MessageDigest.getInstance("SHA-256").digest(customerId.toByteArray(Charsets.UTF_8)))
+
+    private suspend fun JsonObjectBuilder.putIntegrity(cid: String) {
+        val source = config.deviceIntegrity ?: return
+        val token = integrityToken(cid, source)
+        if (token != null) {
+            put(
+                "integrity",
+                buildJsonObject {
+                    put("platform", JsonPrimitive("android"))
+                    put("token", JsonPrimitive(token))
+                },
+            )
+        } else {
+            diagnostic("deviceIntegrity", "token unavailable")
+        }
+    }
+
+    private suspend fun integrityToken(cid: String, source: suspend (String) -> String?): String? {
+        val deferred = integrityMutex.withLock {
+            val existing = integrityDeferred
+            if (existing != null && integrityDeferredCid == cid) {
+                existing
+            } else {
+                scope.async {
+                    runCatching { withTimeoutOrNull(10_000) { source(integrityNonce(cid)) } }
+                        .getOrNull()
+                }.also {
+                    integrityDeferred = it
+                    integrityDeferredCid = cid
+                }
+            }
+        }
+        return deferred.await()
     }
 
     /**
@@ -491,8 +538,9 @@ public class RevnixClient(private val config: RevnixConfig) {
         if (referrer.isBlank()) return
         scope.launch {
             try {
+                val cid = customerId()
                 val body = buildJsonObject {
-                    put("customerId", JsonPrimitive(customerId()))
+                    put("customerId", JsonPrimitive(cid))
                     put("occurredAt", JsonPrimitive(config.now()))
                     put("sdkVersion", JsonPrimitive(SDK_VERSION))
                     put("installReferrer", JsonPrimitive(referrer.take(1024)))
@@ -500,6 +548,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                     appVersion?.let { put("appVersion", JsonPrimitive(it)) }
                     source?.let { put("referrerSource", JsonPrimitive(it)) }
                     config.device?.deviceKey?.let { put("deviceKey", JsonPrimitive(it)) }
+                    putIntegrity(cid)
                 }
                 val raw = request("POST", listOf("v1", "installs"), body)
                 refreshAttribution()
@@ -788,14 +837,16 @@ public class RevnixClient(private val config: RevnixConfig) {
         val payload = listOf(provider, network, campaign.orEmpty(), adGroup.orEmpty(), creative.orEmpty())
             .joinToString("\u0001")
         if (config.storage.get(KEY_LAST_ATTRIBUTION) == payload) return
+        val cid = customerId()
         val body = buildJsonObject {
-            put("customerId", JsonPrimitive(customerId()))
+            put("customerId", JsonPrimitive(cid))
             put("provider", JsonPrimitive(provider.take(100)))
             put("network", JsonPrimitive(network.take(100)))
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
             campaign?.let { put("campaign", JsonPrimitive(it.take(100))) }
             adGroup?.let { put("adGroup", JsonPrimitive(it.take(100))) }
             creative?.let { put("creative", JsonPrimitive(it.take(100))) }
+            putIntegrity(cid)
         }
         try {
             request("POST", listOf("v1", "attribution"), body)
