@@ -119,6 +119,11 @@ public data class RevnixConfig(
      * this handler is reported through [onDiagnostic] and swallowed.
      */
     val onAttribution: ((RevnixAttribution) -> Unit)? = null,
+    /**
+     * Play Integrity token source for the install report. Pass
+     * `playIntegrity(context)` from revnix-android.
+     */
+    val deviceIntegrity: (suspend (nonce: String) -> String?)? = null,
 ) {
     /**
      * REV-272: the rule the client reads — [implicitPlacements] when set, else

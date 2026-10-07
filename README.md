@@ -468,6 +468,32 @@ val client = RevnixClient(RevnixConfig(
 ))
 ```
 
+### Device integrity
+
+Pass `deviceIntegrity = playIntegrity(context)` to have every install-related
+call (`registerInstall`, `handleInstallReferrer`, `setAttribution`) carry a
+Play Integrity classic token, so the server can verify the install came from
+the genuine app on a genuine device:
+
+```kotlin
+val client = RevnixClient(RevnixConfig(
+    apiKey = "rvx_pk_live_…", baseUrl = "https://….convex.site",
+    storage = AndroidStorage(app),
+    deviceIntegrity = playIntegrity(app),
+))
+```
+
+The classic request is made at most once per customer id per process. The
+first call to wait on it pays the cost (up to 10s on a cold first launch,
+while Play services warm up), the rest share that same token, and the
+server dedupes verification across the calls it rides on. Requires linking a
+Cloud project to your app in Play Console → App integrity (the same project
+as the service account given to Revnix), and raising the classic-request
+quota if your install volume exceeds the 10k/day default. Turn on "Require
+device integrity" in Revnix Settings → Fraud prevention to enforce it
+server-side. A failed or timed-out check never blocks the install report; it
+just omits the token.
+
 ## Two Android-specific rules
 
 **Acknowledgement happens after the claim is recorded.** The backend never

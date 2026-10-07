@@ -35,6 +35,7 @@ dependencies {
     // Play Billing 8 — the mandatory line for the Aug/Nov 2026 deadlines.
     api("com.android.billingclient:billing-ktx:8.3.0")
     implementation("com.android.installreferrer:installreferrer:2.2")
+    implementation("com.google.android.play:integrity:1.6.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     testImplementation(kotlin("test"))

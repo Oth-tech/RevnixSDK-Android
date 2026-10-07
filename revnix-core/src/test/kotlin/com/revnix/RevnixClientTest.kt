@@ -13,8 +13,10 @@ import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -107,6 +109,7 @@ class RevnixClientTest {
         onDeferredDeepLink: ((String, DeferredDeepLinkMatch) -> Unit)? = null,
         onAttribution: ((RevnixAttribution) -> Unit)? = null,
         lifecycle: RevnixLifecycle? = null,
+        deviceIntegrity: (suspend (String) -> String?)? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -126,6 +129,7 @@ class RevnixClientTest {
             implicitPlacements = implicitPlacements,
             onDeferredDeepLink = onDeferredDeepLink,
             onAttribution = onAttribution,
+            deviceIntegrity = deviceIntegrity,
         )
     ).also { clients += it }
 
@@ -536,6 +540,96 @@ class RevnixClientTest {
         val client = makeClient(device = null)
         client.resolvePlacement("main")
         assertNull(server.takeRequest().getHeader("X-Revnix-Device"))
+    }
+
+    @Test
+    fun `registerInstall omits integrity when deviceIntegrity is not configured`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        val client = makeClient()
+        client.registerInstall()
+        val body = requestBody(server.takeRequest())
+        assertNull(body["integrity"])
+    }
+
+    @Test
+    fun `registerInstall carries the integrity token and feeds the expected nonce`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        var receivedNonce: String? = null
+        val client = makeClient(deviceIntegrity = { nonce -> receivedNonce = nonce; "tok" })
+
+        client.registerInstall()
+
+        val body = requestBody(server.takeRequest())
+        val integrity = body["integrity"]!!.jsonObject
+        assertEquals("android", integrity["platform"]!!.jsonPrimitive.content)
+        assertEquals("tok", integrity["token"]!!.jsonPrimitive.content)
+        assertEquals(client.integrityNonce(client.customerId()), receivedNonce)
+        assertEquals("ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", client.integrityNonce("abc"))
+    }
+
+    @Test
+    fun `registerInstall still posts when deviceIntegrity throws`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") })
+        val diagnostics = mutableListOf<String>()
+        val client = makeClient(
+            deviceIntegrity = { throw RuntimeException("no play services") },
+            onDiagnostic = { diagnostics += it.op },
+        )
+
+        client.registerInstall()
+
+        val body = requestBody(server.takeRequest())
+        assertNull(body["integrity"])
+        assertTrue(diagnostics.contains("deviceIntegrity"))
+    }
+
+    @Test
+    fun `a cancelled integrity provider never blocks later install-creating requests`() = runBlocking {
+        route(
+            "v1/installs" to { json(200, "{}") },
+            "v1/attribution" to { json(200, "{}") },
+        )
+        val diagnostics = mutableListOf<String>()
+        val client = makeClient(
+            deviceIntegrity = { throw CancellationException("x") },
+            onDiagnostic = { diagnostics += it.op },
+        )
+
+        client.registerInstall()
+        client.setAttribution(provider = "adjust", network = "Facebook Installs")
+
+        repeat(2) { assertNull(requestBody(server.takeRequest())["integrity"]) }
+        assertTrue(diagnostics.contains("deviceIntegrity"))
+    }
+
+    @Test
+    fun `the integrity provider runs once for concurrent install-creating requests, and every body carries the same token`() = runBlocking {
+        route(
+            "v1/installs" to { json(200, "{}") },
+            "v1/attribution" to { json(200, "{}") },
+        )
+        val calls = AtomicInteger(0)
+        val client = makeClient(
+            deviceIntegrity = {
+                calls.incrementAndGet()
+                delay(50)
+                "tok"
+            },
+        )
+
+        client.customerId()
+        val install = async { client.registerInstall() }
+        client.handleInstallReferrer("utm_source=x")
+        client.setAttribution(provider = "adjust", network = "Facebook Installs")
+        install.await()
+
+        val bodies = (1..3).map {
+            requestBody(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!)
+        }
+        bodies.forEach { body ->
+            assertEquals("tok", body["integrity"]!!.jsonObject["token"]!!.jsonPrimitive.content)
+        }
+        assertEquals(1, calls.get())
     }
 
     // MARK: - Reinstall handling (MS2)
