@@ -11,19 +11,24 @@ import com.android.billingclient.api.PendingPurchasesParams
 import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
+import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import com.android.billingclient.api.acknowledgePurchase
+import com.android.billingclient.api.queryProductDetails
 import com.android.billingclient.api.queryPurchasesAsync
 import com.revnix.RegisterPurchaseInput
+import com.revnix.RegisterPurchaseResult
 import com.revnix.RevnixClient
 import com.revnix.RevnixDiagnostic
 import com.revnix.RevnixError
 import com.revnix.RevnixStore
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Play Billing 8 glue — the reason a native SDK exists on Android.
@@ -45,31 +50,57 @@ import kotlinx.coroutines.launch
  * `provisional = true` on store-connected tenants until it does. Surface it in
  * your UI if you message entitlement state differently while pending.
  */
-public class PlayBillingConnector private constructor(
-    context: Context,
+public class PlayBillingConnector internal constructor(
     private val client: RevnixClient,
     private val onDiagnostic: ((RevnixDiagnostic) -> Unit)?,
+    billingClient: (PurchasesUpdatedListener) -> BillingClient,
 ) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
+    internal val pending = mutableMapOf<String, CompletableDeferred<RegisterPurchaseResult?>>()
+
     private val purchasesUpdatedListener = PurchasesUpdatedListener { result, purchases ->
-        if (result.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
-            purchases.forEach { purchase -> scope.launch { register(purchase) } }
-        } else if (result.responseCode != BillingClient.BillingResponseCode.USER_CANCELED) {
-            diagnostic("purchasesUpdated", "billing result ${result.responseCode}")
+        when {
+            result.responseCode == BillingClient.BillingResponseCode.OK && purchases != null ->
+                purchases.forEach { purchase ->
+                    scope.launch {
+                        val waiting = purchase.products.mapNotNull { pending.remove(it) }
+                        try {
+                            when (val outcome = register(purchase)) {
+                                is Registration.Registered -> waiting.forEach { it.complete(outcome.result) }
+                                is Registration.Queued -> waiting.forEach { it.completeExceptionally(outcome.err) }
+                                is Registration.Refused -> waiting.forEach { it.completeExceptionally(outcome.err) }
+                                Registration.Pending -> waiting.forEach { it.complete(null) }
+                            }
+                        } catch (err: Throwable) {
+                            waiting.forEach { it.completeExceptionally(err) }
+                        }
+                    }
+                }
+            result.responseCode == BillingClient.BillingResponseCode.OK ||
+                result.responseCode == BillingClient.BillingResponseCode.USER_CANCELED -> {
+                pending.values.forEach { it.complete(null) }
+                pending.clear()
+            }
+            result.responseCode == BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
+                val waiting = pending.values.toList()
+                pending.clear()
+                scope.launch {
+                    runCatching { restore() }
+                    waiting.forEach { it.complete(null) }
+                }
+            }
+            else -> {
+                diagnostic("purchasesUpdated", "billing result ${result.responseCode}")
+                val failure = billingFailure(result)
+                pending.values.forEach { it.completeExceptionally(failure) }
+                pending.clear()
+            }
         }
     }
 
-    private val billing: BillingClient = BillingClient.newBuilder(context.applicationContext)
-        .setListener(purchasesUpdatedListener)
-        .enablePendingPurchases(
-            PendingPurchasesParams.newBuilder().enableOneTimeProducts().build()
-        )
-        // v8 reconnects on its own; without this every dropped service
-        // binding would silently stop delivering purchase updates.
-        .enableAutoServiceReconnection()
-        .build()
+    private val billing: BillingClient = billingClient(purchasesUpdatedListener)
 
     public companion object {
         /**
@@ -82,7 +113,17 @@ public class PlayBillingConnector private constructor(
             client: RevnixClient,
             onDiagnostic: ((RevnixDiagnostic) -> Unit)? = null,
         ): PlayBillingConnector =
-            PlayBillingConnector(context, client, onDiagnostic).also { it.connect() }
+            PlayBillingConnector(client, onDiagnostic) { listener ->
+                BillingClient.newBuilder(context.applicationContext)
+                    .setListener(listener)
+                    .enablePendingPurchases(
+                        PendingPurchasesParams.newBuilder().enableOneTimeProducts().build()
+                    )
+                    // v8 reconnects on its own; without this every dropped service
+                    // binding would silently stop delivering purchase updates.
+                    .enableAutoServiceReconnection()
+                    .build()
+            }.also { it.connect() }
     }
 
     private fun connect() {
@@ -129,6 +170,50 @@ public class PlayBillingConnector private constructor(
     }
 
     /**
+     * Buy [productId]: opens the Play sheet, registers the purchase with
+     * Revnix, acknowledges it and returns the registration. Null when the
+     * customer cancels, the purchase is pending, or it was already owned (then
+     * it is restored instead). Throws the [RevnixError] registration raised
+     * when Play charged but Revnix queued (acknowledged) or refused (not
+     * acknowledged) the claim, [ProductNotFoundException] when Play has no such
+     * product, and [BillingException] for any other Play failure.
+     */
+    public suspend fun purchase(activity: Activity, productId: String): RegisterPurchaseResult? =
+        withContext(Dispatchers.Main.immediate) {
+            val lookups = mutableListOf<BillingResult>()
+            val details = listOf(BillingClient.ProductType.SUBS, BillingClient.ProductType.INAPP)
+                .firstNotNullOfOrNull { type ->
+                    val product = QueryProductDetailsParams.Product.newBuilder()
+                        .setProductId(productId)
+                        .setProductType(type)
+                        .build()
+                    val params = QueryProductDetailsParams.newBuilder().setProductList(listOf(product)).build()
+                    val result = billing.queryProductDetails(params)
+                    lookups += result.billingResult
+                    result.productDetailsList?.firstOrNull()
+                } ?: throw if (lookups.all { it.responseCode != BillingClient.BillingResponseCode.OK }) {
+                    billingFailure(lookups.last())
+                } else {
+                    ProductNotFoundException(productId)
+                }
+
+            val deferred = CompletableDeferred<RegisterPurchaseResult?>()
+            pending.put(productId, deferred)?.complete(null)
+            // ponytail: first offer of the first base plan; take an offer token from the caller once a product sells several base plans.
+            val launched = launchPurchase(activity, details, details.subscriptionOfferDetails?.firstOrNull()?.offerToken)
+            if (launched.responseCode == BillingClient.BillingResponseCode.OK) return@withContext deferred.await()
+            pending.remove(productId)
+            when (launched.responseCode) {
+                BillingClient.BillingResponseCode.USER_CANCELED -> null
+                BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
+                    restore()
+                    null
+                }
+                else -> throw billingFailure(launched)
+            }
+        }
+
+    /**
      * Re-register everything the device owns. The server dedupes on the shared
      * purchaseKey, so this is always safe to call.
      */
@@ -142,21 +227,22 @@ public class PlayBillingConnector private constructor(
                 continue
             }
             for (purchase in result.purchasesList) {
-                if (register(purchase)) registered += 1
+                val outcome = register(purchase)
+                if (outcome is Registration.Registered || outcome is Registration.Queued) registered += 1
             }
         }
         return registered
     }
 
-    /**
-     * Register one purchase, then acknowledge it. Returns true when the claim
-     * is safely on its way to Revnix (delivered or durably queued).
-     */
-    private suspend fun register(purchase: Purchase): Boolean {
-        if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) {
-            // PENDING (e.g. cash payment) — Play will call back on completion.
-            return false
-        }
+    private sealed interface Registration {
+        data class Registered(val result: RegisterPurchaseResult) : Registration
+        data class Queued(val err: RevnixError) : Registration
+        data class Refused(val err: RevnixError) : Registration
+        data object Pending : Registration
+    }
+
+    private suspend fun register(purchase: Purchase): Registration {
+        if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) return Registration.Pending
         val input = RegisterPurchaseInput(
             source = RevnixStore.GOOGLE,
             // Google has no separate transaction id — the token is both.
@@ -166,25 +252,20 @@ public class PlayBillingConnector private constructor(
             occurredAt = purchase.purchaseTime,
         )
 
-        val recorded = try {
-            client.registerPurchase(input)
-            true
+        val outcome = try {
+            Registration.Registered(client.registerPurchase(input))
         } catch (err: RevnixError) {
-            // Retryable failures are queued durably by the client, so the
-            // claim is not lost and acknowledging is still correct. A
-            // deliberate refusal is NOT queued — leaving it unacknowledged
-            // lets Google refund it rather than stranding the customer.
             if (err.isRetryable) {
                 diagnostic("registerPurchase", "queued: ${err.message}")
-                true
+                Registration.Queued(err)
             } else {
                 diagnostic("registerPurchase", "refused: ${err.message}")
-                false
+                Registration.Refused(err)
             }
         }
 
-        if (recorded) acknowledge(purchase)
-        return recorded
+        if (outcome !is Registration.Refused) acknowledge(purchase)
+        return outcome
     }
 
     /** Acknowledge inside Google's 3-day window — never before the claim. */
@@ -202,10 +283,35 @@ public class PlayBillingConnector private constructor(
     /** Release the connection and the internal scope. */
     public fun close() {
         billing.endConnection()
+        pending.values.forEach { it.completeExceptionally(BillingException(-1, "billing closed", false)) }
+        pending.clear()
         scope.cancel()
     }
+
+    private fun billingFailure(result: BillingResult) = BillingException(
+        result.responseCode,
+        "billing ${result.responseCode} ${result.debugMessage}",
+        isRetryable = result.responseCode in transientBillingCodes,
+    )
 
     private fun diagnostic(op: String, message: String) {
         onDiagnostic?.invoke(RevnixDiagnostic(op, message))
     }
 }
+
+private val transientBillingCodes = setOf(
+    BillingClient.BillingResponseCode.SERVICE_DISCONNECTED,
+    BillingClient.BillingResponseCode.NETWORK_ERROR,
+    BillingClient.BillingResponseCode.ERROR,
+    BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE,
+)
+
+/** A Play Billing failure; [isRetryable] is true only for transient Play codes. */
+public class BillingException(
+    public val responseCode: Int,
+    message: String,
+    public val isRetryable: Boolean,
+) : RuntimeException(message)
+
+/** Play has no product with this id. */
+public class ProductNotFoundException(productId: String) : NoSuchElementException("No store product \"$productId\"")
