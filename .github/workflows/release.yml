@@ -1,0 +1,249 @@
+# Maven Central versions are immutable: the publish step runs before the
+# tag step, so a failed publish leaves no tag behind.
+
+name: Release
+run-name: "Release ${{ inputs.run_key || format('manual-{0}', github.run_id) }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump. auto reads the Unreleased section of CHANGELOG.md."
+        type: choice
+        options: [auto, major, minor, patch]
+        default: auto
+      version:
+        description: "Exact next version (x.y.z, above the current one). Empty = bump."
+        type: string
+        default: ""
+      app_sha:
+        description: "revnix-app commit this release rides on (recorded in the changelog)."
+        type: string
+        default: ""
+      run_key:
+        description: "Caller's correlation key; becomes the run name so the caller can find this run."
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test main before touching it
+        run: ./gradlew :revnix-core:test :revnix-android:testReleaseUnitTest
+
+      - name: Is main already ahead of the tags?
+        id: pending
+        run: |
+          CURRENT=$(sed -n 's/^[[:space:]]*version = "\([^"]*\)".*/\1/p' build.gradle.kts)
+          if git ls-remote --exit-code --tags origin "refs/tags/v$CURRENT" >/dev/null 2>&1; then
+            echo "v$CURRENT is tagged; a normal release follows."
+            echo "pending=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$CURRENT is on main but not tagged (first release, or a run that failed after landing), releasing it instead of bumping."
+            scripts/release.sh --notes-for "$CURRENT" --notes-out "$RUNNER_TEMP/release-notes.md"
+            {
+              echo "pending=true"
+              echo "version=$CURRENT"
+              echo "sha=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Has the code moved since the last release?
+        if: steps.pending.outputs.pending != 'true'
+        id: changed
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          CURRENT=$(sed -n 's/^[[:space:]]*version = "\([^"]*\)".*/\1/p' build.gradle.kts)
+          if git rev-parse -q --verify "refs/tags/v$CURRENT" >/dev/null; then
+            if git diff --quiet "v$CURRENT" HEAD -- . ':(exclude).github' ':(exclude)*.md'; then
+              CHANGED=false
+            else
+              CHANGED=true
+            fi
+            echo "Since v$CURRENT: changed=$CHANGED"
+          else
+            CHANGED=true
+            echo "No tag v$CURRENT to compare against; treating the tree as changed."
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          RELEASE=true
+          [ "$BUMP" = auto ] && [ "$CHANGED" = false ] && RELEASE=false
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Decide and apply the next version
+        if: steps.changed.outputs.release == 'true'
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          VERSION: ${{ inputs.version }}
+          APP_SHA: ${{ inputs.app_sha }}
+        run: |
+          scripts/release.sh \
+            --bump "$BUMP" \
+            --version "$VERSION" \
+            --app-sha "$APP_SHA" \
+            --changed "${{ steps.changed.outputs.changed }}" \
+            --notes-out "$RUNNER_TEMP/release-notes.md"
+
+      - name: Refuse to reuse a version that already exists
+        if: steps.changed.outputs.release == 'true'
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v$NEXT" >/dev/null 2>&1; then
+            echo "::error::Tag v$NEXT already exists. Bump build.gradle.kts past it and re-run."
+            exit 1
+          fi
+
+      - name: build.gradle.kts and both SDK_VERSION constants agree
+        if: steps.changed.outputs.release == 'true'
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          GRADLE=$(sed -n 's/^[[:space:]]*version = "\([^"]*\)".*/\1/p' build.gradle.kts)
+          CORE=$(sed -n 's/.*const val SDK_VERSION = "\([^"]*\)".*/\1/p' revnix-core/src/main/kotlin/com/revnix/RevnixClient.kt)
+          KMP=$(sed -n 's/.*const val SDK_VERSION = "\([^"]*\)".*/\1/p' revnix-kmp/src/commonMain/kotlin/com/revnix/kmp/RevnixClient.kt)
+          if [ "$GRADLE" != "$NEXT" ] || [ "$CORE" != "$NEXT" ] || [ "$KMP" != "$NEXT" ]; then
+            echo "::error::expected $NEXT everywhere, got gradle=$GRADLE core=$CORE kmp=$KMP."
+            exit 1
+          fi
+
+      - name: Test the bumped tree
+        if: steps.changed.outputs.release == 'true'
+        run: ./gradlew :revnix-core:test :revnix-android:testReleaseUnitTest
+
+      - name: Land the bump through a pull request (main takes merge commits only)
+        if: steps.changed.outputs.release == 'true'
+        id: land
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+          SUMMARY: ${{ steps.version.outputs.summary }}
+        run: |
+          BRANCH="release/v$NEXT"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "Release $NEXT" -m "$SUMMARY"
+          git push origin "$BRANCH"
+          PR_URL=$(gh pr create --base main --head "$BRANCH" \
+            --title "Release $NEXT" --body-file "$RUNNER_TEMP/release-notes.md")
+          echo "Opened $PR_URL"
+          # Mergeability is computed asynchronously; give it a few tries.
+          MERGED=""
+          for i in 1 2 3 4 5 6; do
+            if gh pr merge "$PR_URL" --merge --delete-branch; then MERGED=1; break; fi
+            sleep 10
+          done
+          if [ -z "$MERGED" ]; then
+            echo "::error::Could not merge $PR_URL, nothing was released."
+            exit 1
+          fi
+          git fetch origin main
+          git checkout -q origin/main
+          LANDED=$(sed -n 's/^[[:space:]]*version = "\([^"]*\)".*/\1/p' build.gradle.kts)
+          if [ "$LANDED" != "$NEXT" ]; then
+            echo "::error::main carries $LANDED after the merge, expected $NEXT."
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve what to release
+        if: steps.pending.outputs.pending == 'true' || steps.changed.outputs.release == 'true'
+        id: pub
+        env:
+          PENDING: ${{ steps.pending.outputs.pending }}
+        run: |
+          if [ "$PENDING" = "true" ]; then
+            echo "next=${{ steps.pending.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "sha=${{ steps.pending.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "next=${{ steps.version.outputs.next }}" >> "$GITHUB_OUTPUT"
+            echo "sha=${{ steps.land.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to Maven Central
+        if: steps.pending.outputs.pending == 'true' || steps.changed.outputs.release == 'true'
+        env:
+          SHA: ${{ steps.pub.outputs.sha }}
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          git checkout -q "$SHA"
+          ./gradlew publishAndReleaseToMavenCentral --no-configuration-cache
+
+      - name: Tag and release
+        if: steps.pending.outputs.pending == 'true' || steps.changed.outputs.release == 'true'
+        env:
+          NEXT: ${{ steps.pub.outputs.next }}
+          SHA: ${{ steps.pub.outputs.sha }}
+        run: |
+          git tag -a "v$NEXT" -m "Revnix $NEXT" "$SHA"
+          git push origin "v$NEXT"
+          gh release create "v$NEXT" --target "$SHA" --title "Revnix $NEXT" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Summary
+        if: always()
+        env:
+          CURRENT: ${{ steps.version.outputs.current }}
+          NEXT: ${{ steps.pub.outputs.next }}
+          LEVEL: ${{ steps.version.outputs.level }}
+          LOCKSTEP: ${{ steps.version.outputs.lockstep }}
+          PR: ${{ steps.land.outputs.pr }}
+          PENDING: ${{ steps.pending.outputs.pending }}
+          APP_SHA: ${{ inputs.app_sha }}
+          RELEASE: ${{ steps.changed.outputs.release }}
+        run: |
+          if [ "$RELEASE" = "false" ]; then
+            {
+              echo "## Revnix (Kotlin): no release"
+              echo ""
+              echo "no changes since the last tag, skipped"
+              echo "- status: ${{ job.status }}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Revnix (Kotlin) ${NEXT:-?}"
+            echo ""
+            if [ "$PENDING" = "true" ]; then
+              echo "- released the version already on main (a previous run merged it but did not tag)"
+            else
+              echo "- from ${CURRENT:-?} (${LEVEL:-?} bump, lockstep=${LOCKSTEP:-?})"
+            fi
+            [ -n "$PR" ] && echo "- release PR: $PR"
+            [ -n "$APP_SHA" ] && echo "- revnix-app: $APP_SHA"
+            echo "- Maven Central: io.revnix:revnix-android:${NEXT:-?}, io.revnix:revnix-core:${NEXT:-?}"
+            echo "- status: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

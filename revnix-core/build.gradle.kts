@@ -1,6 +1,16 @@
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.KotlinJvm
+
 plugins {
     kotlin("jvm")
     kotlin("plugin.serialization")
+    id("com.vanniktech.maven.publish")
+}
+
+description = "Revnix client core for JVM: entitlements, offline cache policy, purchases and retry queue."
+
+mavenPublishing {
+    configure(KotlinJvm(javadocJar = JavadocJar.Empty(), sourcesJar = true))
 }
 
 kotlin {
