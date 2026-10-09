@@ -8,5 +8,5 @@ plugins {
 
 allprojects {
     group = "com.revnix"
-    version = "0.3.0"
+    version = "1.5.0"
 }

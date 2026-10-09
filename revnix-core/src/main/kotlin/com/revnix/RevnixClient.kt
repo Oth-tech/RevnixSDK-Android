@@ -150,7 +150,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         private const val EXPIRY_GRACE_MS = 3L * 24 * 3600 * 1000
         private const val ROLLBACK_TOLERANCE_MS = 5L * 60 * 1000
         private const val CACHE_CUSTOMERS = 4
-        private const val SDK_VERSION = "0.3.0"
+        private const val SDK_VERSION = "1.5.0"
 
         private const val KEY_CUSTOMER_ID = "revnix.customerId"
         private const val KEY_INSTALLED_AT = "revnix.installedAt"

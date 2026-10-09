@@ -35,7 +35,7 @@ Also public, for less common cases:
 
 ```kotlin
 dependencies {
-    implementation("com.revnix:revnix-android:0.3.0")
+    implementation("com.revnix:revnix-android:1.5.0")
 }
 ```
 
@@ -568,7 +568,7 @@ purchases in a sandbox app, not by either suite.
 
 ## Distribution status
 
-**Not yet published.** `com.revnix:revnix-android:0.3.0` is the intended
+**Not yet published.** `com.revnix:revnix-android:1.5.0` is the intended
 coordinate, but nothing is on Maven Central yet, so that dependency will not
 resolve. Until it ships, apps integrate over the
 [REST API](https://revnix.io/docs/rest-api), the same `/v1` contract this SDK
