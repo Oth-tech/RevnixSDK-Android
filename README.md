@@ -1,4 +1,23 @@
-# Revnix Kotlin SDK
+<p align="center">
+  <a href="https://www.revnix.io"><img src="https://www.revnix.io/sdk/logo.png" width="360" alt="Revnix"></a>
+</p>
+
+<h1 align="center">Subscriptions, Paywalls and Attribution<br>for Your Android App</h1>
+
+<p align="center">
+  <a href="https://central.sonatype.com/artifact/io.revnix/revnix-android"><img src="https://img.shields.io/maven-central/v/io.revnix/revnix-android?color=2f6fe0" alt="Maven Central"></a>
+  <a href="https://github.com/Oth-tech/RevnixSDK-Android/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Oth-tech/RevnixSDK-Android?color=2f6fe0" alt="license"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.revnix.io"><b>Website</b></a> •
+  <a href="https://www.revnix.io/docs/android"><b>Docs</b></a> •
+  <a href="https://www.revnix.io/docs/android/setup"><b>API Reference</b></a>
+</p>
+
+![Revnix: subscriptions, paywalls and attribution for mobile apps](https://www.revnix.io/sdk/hero.png)
+
+Revnix SDK makes in-app subscriptions, paywalls and attribution for Android fast and easy. One Gradle dependency buys through Play Billing 8, validates the purchase on the server and unlocks the entitlement, offline-correct.
 
 Native Android SDK for [Revnix](https://revnix.io), Play Billing 8 purchase
 glue plus the same resilience policy as `revnix-react` and `revnix-swift`.
@@ -30,14 +49,13 @@ Also public, for less common cases:
 
 ## Install
 
-> Not yet published to Maven Central; build from source for now (see
-> [Distribution status](#distribution-status)).
-
 ```kotlin
 dependencies {
-    implementation("com.revnix:revnix-android:1.5.0")
+    implementation("io.revnix:revnix-android:1.5.0")
 }
 ```
+
+A non-Android JVM host depends on `io.revnix:revnix-core` alone.
 
 ## Quick start
 
@@ -75,6 +93,8 @@ your server (see the docs recipe).
 
 ## Paywalls and A/B tests
 
+![Revnix paywall builder with a live device preview](https://www.revnix.io/sdk/react-native/paywalls.png)
+
 `resolvePlacement` returns the published offering plus a typed `PaywallConfig`:
 nine layouts in `template`: `focus`, `feature-list`, `minimal`, `hero`,
 `timeline`, `plans`, `feature-grid`, `offer`, `reveal`, a light/dark `mode`,
@@ -100,6 +120,8 @@ appScope.launch {
 ```
 
 Assignment is sticky per customer and survives identity merges.
+
+![Revnix A/B test results with a winner and credible intervals](https://www.revnix.io/sdk/react-native/ab-test.png)
 
 ### Targeting: `setAttributes`
 
@@ -227,6 +249,8 @@ idempotent. It appends `ad.revenue`, which feeds only the ROAS table on the
 Links page.
 
 ### Custom events
+
+![Revnix overview dashboard with revenue and MRR](https://www.revnix.io/sdk/react-native/analytics.png)
 
 Call `track` for in-app events you want on the customer's ledger (level up,
 tutorial complete, …). It is not for purchases: those stay on
@@ -444,6 +468,8 @@ never recorded.
 
 ### Install attribution
 
+![Revnix ROAS by channel report](https://www.revnix.io/sdk/react-native/attribution.png)
+
 `client.getAttribution()` answers how this install was attributed:
 `RevnixAttribution(installMatch, attributedAt, …)`, where `installMatch` is
 `referrer`, `click`, `impression` or `organic`, alongside the campaign fields
@@ -565,11 +591,3 @@ purchases in a sandbox app, not by either suite.
 
 - `identify` / `alias`: server-proxied by design.
 - Amazon and other stores.
-
-## Distribution status
-
-**Not yet published.** `com.revnix:revnix-android:1.5.0` is the intended
-coordinate, but nothing is on Maven Central yet, so that dependency will not
-resolve. Until it ships, apps integrate over the
-[REST API](https://revnix.io/docs/rest-api), the same `/v1` contract this SDK
-speaks, so migrating later does not change the backend integration.

@@ -1,7 +1,20 @@
+import com.vanniktech.maven.publish.AndroidSingleVariantLibrary
+
 plugins {
     id("com.android.library")
     kotlin("android")
+    id("com.vanniktech.maven.publish")
 }
+
+description = "Revnix SDK for Android: Play Billing 8 purchases, entitlements, paywalls and attribution."
+
+mavenPublishing {
+    // AGP's bundled Dokka cannot read Java 17 sealed classes (PermittedSubclasses requires ASM9).
+    configure(AndroidSingleVariantLibrary("release", sourcesJar = true, publishJavadocJar = false))
+}
+
+val emptyJavadocJar by tasks.registering(Jar::class) { archiveClassifier.set("javadoc") }
+publishing.publications.withType<MavenPublication>().configureEach { artifact(emptyJavadocJar) }
 
 android {
     namespace = "com.revnix.android"
