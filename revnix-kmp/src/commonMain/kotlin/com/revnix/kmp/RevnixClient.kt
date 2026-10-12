@@ -75,6 +75,9 @@ public class RevnixClient(private val config: RevnixConfig) {
         const val KEY_WALL_CLOCK = "revnix.lastWallClock"
         const val KEY_QUEUE = "revnix.pendingPurchases"
         const val KEY_CACHE_INDEX = "revnix.entIndex"
+
+        const val PURCHASE_QUEUE_CAP = 100
+        const val PURCHASE_MAX_AGE_MS = 30L * 24 * 3600 * 1000
     }
 
     // MARK: - Identity
@@ -235,8 +238,14 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     public suspend fun retryPendingPurchases(): Int {
         val cid = customerId()
+        val now = config.now()
         var delivered = 0
-        for (item in queuedItems()) {
+        for (item in stampedQueuedItems(now)) {
+            if (now - (item.queuedAt ?: now) > PURCHASE_MAX_AGE_MS) {
+                removeQueued(item.key)
+                diagnostic("retryPendingPurchases", "expired ${item.key}")
+                continue
+            }
             try {
                 postPurchase(item.toInput(), cid)
                 removeQueued(item.key)
@@ -485,6 +494,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         val expiresAt: Long? = null,
         val signedTransactionInfo: String? = null,
         val rawPayload: JsonElement? = null,
+        val queuedAt: Long? = null,
     ) {
         fun toInput(): RegisterPurchaseInput = RegisterPurchaseInput(
             source = RevnixStore.fromWire(source),
@@ -544,6 +554,12 @@ public class RevnixClient(private val config: RevnixConfig) {
             .getOrElse { emptyList() }
     }
 
+    private fun stampedQueuedItems(now: Long): List<QueuedPurchase> {
+        val items = queuedItems()
+        if (items.none { it.queuedAt == null }) return items
+        return items.map { it.copy(queuedAt = it.queuedAt ?: now) }.also { persistQueue(it) }
+    }
+
     private fun persistQueue(items: List<QueuedPurchase>) {
         config.storage.set(KEY_QUEUE, json.encodeToString(queueSerializer, items))
     }
@@ -552,8 +568,10 @@ public class RevnixClient(private val config: RevnixConfig) {
         val items = queuedItems()
         val key = queueKey(input)
         if (items.any { it.key == key }) return
+        val overflow = items.size - PURCHASE_QUEUE_CAP + 1
+        if (overflow > 0) diagnostic("purchaseQueue", "dropped $overflow oldest")
         persistQueue(
-            items + QueuedPurchase(
+            items.drop(overflow.coerceAtLeast(0)) + QueuedPurchase(
                 key = key,
                 source = input.source.wire,
                 token = input.token,
@@ -563,6 +581,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                 expiresAt = input.expiresAt,
                 signedTransactionInfo = input.signedTransactionInfo,
                 rawPayload = input.rawPayload,
+                queuedAt = config.now(),
             )
         )
     }
