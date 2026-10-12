@@ -410,6 +410,54 @@ class RevnixClientTest {
         client.close()
     }
 
+    private fun seededPurchase(id: String, queuedAt: Long?) =
+        """{"key":"apple:seed:$id","source":"apple","token":"seed","productId":"pro.monthly","transactionId":"$id"""" +
+            (queuedAt?.let { ""","queuedAt":$it}""" } ?: "}")
+
+    @Test
+    fun the_purchase_queue_is_capped_at_100_dropping_the_oldest() = runTest {
+        val storage = MemoryStorage()
+        storage.set(
+            "revnix.pendingPurchases",
+            (0 until 100).joinToString(",", "[", "]") { seededPurchase("q$it", 1_700_000_000_000) },
+        )
+        val diagnostics = mutableListOf<RevnixDiagnostic>()
+        val client = makeClient(Recorder(), storage = storage, onDiagnostic = { diagnostics += it }) { _, _ -> null }
+
+        runCatching { client.registerPurchase(purchase) }
+
+        assertEquals(100, client.pendingPurchaseCount())
+        val stored = storage.get("revnix.pendingPurchases")!!
+        assertFalse(stored.contains("apple:seed:q0\""))
+        assertTrue(stored.contains("apple:seed:q1\""))
+        assertTrue(stored.contains("apple:orig.1:txn.1"))
+        assertTrue(diagnostics.any { it.op == "purchaseQueue" })
+        client.close()
+    }
+
+    @Test
+    fun queued_purchases_expire_after_30_days_and_unstamped_ones_count_from_now() = runTest {
+        var now = 1_700_000_000_000L
+        val storage = MemoryStorage()
+        storage.set(
+            "revnix.pendingPurchases",
+            "[${seededPurchase("old", now - 31 * dayMs)},${seededPurchase("legacy", null)}]",
+        )
+        val diagnostics = mutableListOf<RevnixDiagnostic>()
+        val client = makeClient(Recorder(), storage = storage, now = { now }, onDiagnostic = { diagnostics += it }) { _, _ -> null }
+
+        assertEquals(0, client.retryPendingPurchases())
+        assertEquals(1, client.pendingPurchaseCount())
+        assertTrue(storage.get("revnix.pendingPurchases")!!.contains("\"queuedAt\":$now"))
+        assertTrue(diagnostics.any { it.message == "expired apple:seed:old" })
+
+        now += 31 * dayMs
+        assertEquals(0, client.retryPendingPurchases())
+        assertEquals(0, client.pendingPurchaseCount())
+        assertTrue(diagnostics.any { it.message == "expired apple:seed:legacy" })
+        client.close()
+    }
+
     // MARK: - Cache fallback discipline
 
     @Test

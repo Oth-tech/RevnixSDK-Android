@@ -19,21 +19,24 @@ import com.revnix.RevnixStorage
  */
 public class AndroidStorage(context: Context) : RevnixStorage {
 
-    private val prefs: SharedPreferences = context.applicationContext
-        .getSharedPreferences("com.revnix.storage", Context.MODE_PRIVATE)
+    private val app = context.applicationContext
 
-    init {
-        val app = context.applicationContext
+    private val prefs: SharedPreferences by lazy {
+        val prefs = app.getSharedPreferences("com.revnix.storage", Context.MODE_PRIVATE)
         val firstInstallTime = runCatching {
             app.packageManager.getPackageInfo(app.packageName, 0).firstInstallTime
         }.getOrNull()
         if (firstInstallTime != null) {
             val stored = prefs.getLong(KEY_FIRST_INSTALL_TIME, -1L)
-            if (stored != -1L && stored != firstInstallTime) {
-                prefs.edit().clear().commit()
-            }
-            prefs.edit().putLong(KEY_FIRST_INSTALL_TIME, firstInstallTime).apply()
+            val editor = prefs.edit()
+            if (stored != -1L && stored != firstInstallTime) editor.clear()
+            editor.putLong(KEY_FIRST_INSTALL_TIME, firstInstallTime).apply()
         }
+        prefs
+    }
+
+    init {
+        Thread { prefs }.apply { isDaemon = true }.start()
     }
 
     override fun get(key: String): String? = prefs.getString(key, null)

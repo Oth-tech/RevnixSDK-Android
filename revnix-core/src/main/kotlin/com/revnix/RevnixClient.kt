@@ -12,8 +12,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -26,6 +29,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -64,6 +68,7 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     private val http: OkHttpClient = config.httpClient ?: OkHttpClient.Builder()
         .callTimeout(config.timeout.inWholeMilliseconds, TimeUnit.MILLISECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
         .build()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -72,6 +77,11 @@ public class RevnixClient(private val config: RevnixConfig) {
     private var bgFailures = 0
 
     private val deferredDeepLinkLock = Any()
+
+    private val eventQueueLock = Any()
+    private val eventFlushMutex = Mutex()
+    private var eventFlushTimer: Job? = null
+    @Volatile private var eventRetryAt: Long = Long.MIN_VALUE
 
     private val integrityMutex = Mutex()
     private var integrityDeferred: Deferred<String?>? = null
@@ -143,6 +153,13 @@ public class RevnixClient(private val config: RevnixConfig) {
             // /v1/config, and every implicit path is fire-and-forget from here
             // down. `close()` cancels the scope, which ends anything in flight.
             scope.launch { startImplicitPlacements() }
+        } else {
+            subscribeLifecycle()
+        }
+        scope.launch {
+            if (config.storage.get(KEY_EVENT_QUEUE) == null) return@launch
+            delay(EVENT_LAUNCH_FLUSH_DELAY_MS)
+            flushEvents()
         }
     }
 
@@ -165,7 +182,23 @@ public class RevnixClient(private val config: RevnixConfig) {
         private const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
         private const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
 
+        private const val KEY_EVENT_QUEUE = "revnix.eventQueue"
+        private const val KEY_PLACEMENTS_INVALIDATED_AT = "revnix.placementsInvalidatedAt"
+        private const val TRACK_EVENTS_PATH = "v1/events"
+        private const val PAYWALL_EVENTS_PATH = "v1/paywalls/events"
+
         private const val IMPLICIT_CONFIG_RETRY_HOLD_MS = 60_000L
+
+        private const val EVENT_QUEUE_CAP = 1000
+        private const val EVENT_FLUSH_AT = 20
+        private const val EVENT_BATCH_MAX = 100
+        private const val EVENT_FLUSH_DELAY_MS = 10_000L
+        private const val EVENT_LAUNCH_FLUSH_DELAY_MS = 2_000L
+        private const val EVENT_RETRY_HOLD_MS = 30_000L
+        private const val PURCHASE_QUEUE_CAP = 100
+        private const val PURCHASE_MAX_AGE_MS = 30L * 24 * 3600 * 1000
+        private const val PLACEMENT_CACHE_FRESH_MS = 24L * 3600 * 1000
+        private const val CACHED_ENTITLEMENTS_TIMEOUT_MS = 3_000L
 
         private val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
         private val TRACK_EVENT_NAME_REGEX = Regex("^[a-z0-9_]{1,64}$")
@@ -242,8 +275,12 @@ public class RevnixClient(private val config: RevnixConfig) {
      * Network-only read — no TTL shortcut, no cache fallback. Throws on any
      * failure. The read-your-writes poll needs a genuinely fresh cursor.
      */
-    private suspend fun fetchFreshEntitlements(cid: String, nowMs: Long): CustomerEntitlements {
-        val raw = request("GET", listOf("v1", "customers", cid, "entitlements"))
+    private suspend fun fetchFreshEntitlements(
+        cid: String,
+        nowMs: Long,
+        timeoutMs: Long? = null,
+    ): CustomerEntitlements {
+        val raw = request("GET", listOf("v1", "customers", cid, "entitlements"), timeoutMs = timeoutMs)
         val snapshot = decode(CustomerEntitlements.serializer(), raw)
             .copy(stale = false, fetchedAt = nowMs)
         storeCacheEntry(CacheEntry(snapshot, nowMs), cid)
@@ -255,13 +292,14 @@ public class RevnixClient(private val config: RevnixConfig) {
         nowMs: Long,
         rolledBack: Boolean,
     ): CustomerEntitlements {
+        val cached = cacheEntry(cid)
         try {
-            return fetchFreshEntitlements(cid, nowMs)
+            return fetchFreshEntitlements(cid, nowMs, cached?.let { CACHED_ENTITLEMENTS_TIMEOUT_MS })
         } catch (err: RevnixError) {
             // Deliberate rejections rethrow: a kill-switch must not be
             // defeated by the cache.
             if (!err.isRetryable) throw err
-            val entry = cacheEntry(cid) ?: throw err
+            val entry = cached ?: throw err
             return applyOfflinePolicy(entry, nowMs, rolledBack)
         }
     }
@@ -356,6 +394,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                 config.storage.set(KEY_CUSTOMER_ID, result.customerId)
             }
             removeQueued(queueKey(input))
+            invalidatePlacements()
             return result
         } catch (err: RevnixError) {
             if (err.isRetryable) enqueue(input)
@@ -369,11 +408,18 @@ public class RevnixClient(private val config: RevnixConfig) {
      */
     public suspend fun retryPendingPurchases(): Int {
         val cid = customerId()
+        val now = config.now()
         var delivered = 0
-        for (item in queuedItems()) {
+        for (item in stampedQueuedItems(now)) {
+            if (now - (item.queuedAt ?: now) > PURCHASE_MAX_AGE_MS) {
+                removeQueued(item.key)
+                diagnostic("retryPendingPurchases", "expired ${item.key}")
+                continue
+            }
             try {
                 postPurchase(item.toInput(), cid)
                 removeQueued(item.key)
+                invalidatePlacements()
                 delivered += 1
             } catch (err: RevnixError) {
                 if (!err.isRetryable) {
@@ -412,30 +458,90 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     // MARK: - Placements & telemetry
 
+    /**
+     * A cached resolution for this customer, fetched after the last
+     * [setAttributes] or a delivered purchase and up to 24 h old, answers
+     * immediately and is refreshed in the background; otherwise the network
+     * goes first.
+     */
     public suspend fun resolvePlacement(key: String): PlacementResolution {
-        // The customer id makes experiment assignment sticky server-side
-        // (REV-219); older servers simply ignore the parameter.
-        val query = mapOf("customer" to customerId())
-        // REV-268: the device facts ride along so targeting rules see THIS
-        // device on THIS request, and the server stores them as device.*
-        // attributes. Older servers ignore the header.
-        val headers = deviceHeader?.let { mapOf("X-Revnix-Device" to it) }.orEmpty()
+        freshCachedPlacement(key)?.let { cached ->
+            scope.launch {
+                try {
+                    fetchPlacement(key)
+                } catch (err: Throwable) {
+                    if (err is CancellationException) throw err
+                    if (err is RevnixError && !err.isRetryable) {
+                        config.storage.remove(placementKey(key))
+                        config.storage.remove(placementFetchedAtKey(key))
+                    }
+                    bgFailures += 1
+                    diagnostic("resolvePlacement", err.message.orEmpty())
+                }
+            }
+            return cached
+        }
         try {
-            val raw = request(
-                "GET",
-                listOf("v1", "placements", key, "offering"),
-                query = query,
-                headers = headers,
-            )
-            val resolution = decode(PlacementResolution.serializer(), raw)
-            config.storage.set(placementKey(key), raw)
-            return resolution
+            return fetchPlacement(key)
         } catch (err: RevnixError) {
             if (!err.isRetryable) throw err
             val cached = config.storage.get(placementKey(key)) ?: throw err
             return runCatching { decode(PlacementResolution.serializer(), cached) }
                 .getOrElse { throw err }
         }
+    }
+
+    /** Fetch [placementKeys] concurrently into the cache; returns the ones that resolved. */
+    public suspend fun preload(placementKeys: List<String>): List<PlacementResolution> = coroutineScope {
+        placementKeys.map { key ->
+            async {
+                try {
+                    fetchPlacement(key)
+                } catch (err: Throwable) {
+                    if (err is CancellationException) throw err
+                    diagnostic("preload", err.message.orEmpty())
+                    null
+                }
+            }
+        }.awaitAll().filterNotNull()
+    }
+
+    private suspend fun fetchPlacement(key: String): PlacementResolution {
+        val cid = customerId()
+        val query = mapOf("customer" to cid)
+        val headers = deviceHeader?.let { mapOf("X-Revnix-Device" to it) }.orEmpty()
+        val startedAt = config.now()
+        val raw = request(
+            "GET",
+            listOf("v1", "placements", key, "offering"),
+            query = query,
+            headers = headers,
+        )
+        val resolution = decode(PlacementResolution.serializer(), raw)
+        config.storage.set(placementKey(key), raw)
+        config.storage.set(
+            placementFetchedAtKey(key),
+            json.encodeToString(PlacementFetch.serializer(), PlacementFetch(cid, startedAt)),
+        )
+        return resolution
+    }
+
+    private fun invalidatePlacements() {
+        config.storage.set(KEY_PLACEMENTS_INVALIDATED_AT, config.now().toString())
+    }
+
+    @Serializable
+    private data class PlacementFetch(val customerId: String, val fetchedAt: Long)
+
+    private fun freshCachedPlacement(key: String): PlacementResolution? {
+        val stamp = config.storage.get(placementFetchedAtKey(key))
+            ?.let { runCatching { json.decodeFromString(PlacementFetch.serializer(), it) }.getOrNull() }
+            ?: return null
+        val invalidatedAt = config.storage.get(KEY_PLACEMENTS_INVALIDATED_AT)?.toLongOrNull() ?: Long.MIN_VALUE
+        if (stamp.customerId != customerId() || stamp.fetchedAt <= invalidatedAt) return null
+        if (config.now() - stamp.fetchedAt !in 0..PLACEMENT_CACHE_FRESH_MS) return null
+        val raw = config.storage.get(placementKey(key)) ?: return null
+        return runCatching { decode(PlacementResolution.serializer(), raw) }.getOrNull()
     }
 
     /**
@@ -680,7 +786,8 @@ public class RevnixClient(private val config: RevnixConfig) {
      * DID on a display, between the [logPaywallDisplay] that opened it and the
      * [logPaywallClosed] (or purchase) that ended it.
      *
-     * Fire-and-forget like the other beacons: never throws.
+     * Fire-and-forget like the other beacons: never throws. Queued on device
+     * and sent in batches; see [flushEvents].
      *
      * [viewId] is the id [logPaywallDisplay] returned for THIS display.
      * Passing it is what threads the whole life of one impression together and
@@ -714,7 +821,8 @@ public class RevnixClient(private val config: RevnixConfig) {
             put("viewId", JsonPrimitive(viewId))
             put("event", JsonPrimitive(event.wireName))
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
-            eventId?.let { put("eventId", JsonPrimitive(it)) }
+            put("eventId", JsonPrimitive(eventId ?: viewId))
+            put("occurredAt", JsonPrimitive(config.now()))
             placementKey?.let { put("placementKey", JsonPrimitive(it)) }
             paywallId?.let { put("paywallId", JsonPrimitive(it)) }
             productId?.let { put("productId", JsonPrimitive(it)) }
@@ -723,12 +831,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             // localized store error from turning the whole report into a 400.
             message?.let { put("message", JsonPrimitive(it.take(1024))) }
         }
-        try {
-            request("POST", listOf("v1", "paywalls", "events"), body)
-        } catch (err: RevnixError) {
-            bgFailures += 1
-            diagnostic("logPaywallEvent", err.message.orEmpty())
-        }
+        enqueueEvent(PAYWALL_EVENTS_PATH, body)
         // REV-272: backing out of the store sheet is the `transaction_abandon`
         // moment. Reuses the paywall.purchase_abandoned just reported.
         if (event == RevnixPaywallEvent.PurchaseAbandoned) {
@@ -782,7 +885,8 @@ public class RevnixClient(private val config: RevnixConfig) {
     /**
      * Report a custom in-app event by name, with optional flat properties.
      * Not for purchases — those stay on [registerPurchase].
-     * Fire-and-forget like the other beacons: never throws.
+     * Fire-and-forget like the other beacons: never throws. Queued on device
+     * and sent in batches; see [flushEvents].
      */
     public suspend fun track(
         event: String,
@@ -814,11 +918,41 @@ public class RevnixClient(private val config: RevnixConfig) {
                 )
             }
         }
-        try {
-            request("POST", listOf("v1", "events"), body)
-        } catch (err: RevnixError) {
-            bgFailures += 1
-            diagnostic("track", err.message.orEmpty())
+        enqueueEvent(TRACK_EVENTS_PATH, body)
+    }
+
+    /**
+     * Send every queued [track] and [logPaywallEvent] event now. Also runs on
+     * its own: when 20 are queued, 10 s after an event is queued, when the app
+     * goes to the background, and shortly after launch. Never throws; after a
+     * transient failure the queue is kept and no flush runs for 30 s.
+     */
+    public suspend fun flushEvents() {
+        eventFlushMutex.withLock {
+            val now = config.now()
+            if (now < eventRetryAt) {
+                armFlushTimer(eventRetryAt - now)
+                return
+            }
+            val snapshot = synchronized(eventQueueLock) { queuedEvents() }
+            for ((path, items) in snapshot.groupBy { it.path }) {
+                for (chunk in items.chunked(EVENT_BATCH_MAX)) {
+                    val body = buildJsonObject { put("events", JsonArray(chunk.map { it.body })) }
+                    try {
+                        val raw = request("POST", path.split('/'), body)
+                        reportRejectedEvents(decode(EventBatchResponse.serializer(), raw).results, chunk)
+                    } catch (err: RevnixError) {
+                        bgFailures += 1
+                        if (err.isRetryable) {
+                            eventRetryAt = config.now() + EVENT_RETRY_HOLD_MS
+                            diagnostic("eventQueue", "kept ${snapshot.size}: ${err.message}")
+                            return
+                        }
+                        diagnostic("eventQueue", "dropped ${chunk.size}: ${err.message}")
+                    }
+                    removeEvents(chunk)
+                }
+            }
         }
     }
 
@@ -912,15 +1046,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         // when offline: a customer who backgrounds the app during that window
         // and comes back an hour later is a session, and missing the
         // background transition would lose it.
-        config.lifecycle?.let { lifecycle ->
-            lifecycleCancel = runCatching {
-                lifecycle.onStateChange { state -> onAppState(state) }
-            }.getOrElse {
-                // A broken adapter costs session detection, not the client.
-                diagnostic("lifecycleSubscribe", it.message.orEmpty())
-                null
-            }
-        }
+        subscribeLifecycle()
 
         // `customerId()` is what sets mintedThisLaunch, so it runs first.
         customerId()
@@ -941,6 +1067,19 @@ public class RevnixClient(private val config: RevnixConfig) {
         launchBatch = batch
         batch.await()
         launchBatch = null
+    }
+
+    private fun subscribeLifecycle() {
+        val lifecycle = config.lifecycle ?: return
+        lifecycleCancel = runCatching {
+            lifecycle.onStateChange { state ->
+                if (state == RevnixAppState.BACKGROUND) scope.launch { flushEvents() }
+                if (implicitEnabled) onAppState(state)
+            }
+        }.getOrElse {
+            diagnostic("lifecycleSubscribe", it.message.orEmpty())
+            null
+        }
     }
 
     private fun onAppState(state: RevnixAppState) {
@@ -1284,6 +1423,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             )
         }
         request("POST", listOf("v1", "customers", customerId(), "attributes"), body)
+        invalidatePlacements()
     }
 
     // MARK: - Transport
@@ -1294,6 +1434,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         body: JsonObject? = null,
         query: Map<String, String> = emptyMap(),
         headers: Map<String, String> = emptyMap(),
+        timeoutMs: Long? = null,
     ): String = withContext(Dispatchers.IO) {
         val url = config.baseUrl.toHttpUrl().newBuilder().apply {
             segments.forEach { addPathSegment(it) }
@@ -1322,11 +1463,16 @@ public class RevnixClient(private val config: RevnixConfig) {
             builder.method(method, null)
         }
 
+        val client = if (timeoutMs != null && (http.callTimeoutMillis == 0 || http.callTimeoutMillis > timeoutMs)) {
+            http.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+        } else {
+            http
+        }
         // Reading the body can fail too (connection dropped mid-response), so
         // the whole exchange is mapped — otherwise a raw IOException would
         // escape untyped and the offline cache would never engage.
         try {
-            http.newCall(builder.build()).execute().use {
+            client.newCall(builder.build()).execute().use {
                 val text = it.body?.string().orEmpty()
                 if (!it.isSuccessful) {
                     val message = runCatching {
@@ -1371,6 +1517,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         val expiresAt: Long? = null,
         val signedTransactionInfo: String? = null,
         val rawPayload: JsonElement? = null,
+        val queuedAt: Long? = null,
     ) {
         fun toInput(): RegisterPurchaseInput = RegisterPurchaseInput(
             source = RevnixStore.fromWire(source),
@@ -1384,11 +1531,22 @@ public class RevnixClient(private val config: RevnixConfig) {
         )
     }
 
+    @Serializable
+    private data class QueuedEvent(val path: String, val body: JsonObject)
+
+    @Serializable
+    private data class EventBatchResult(val status: Int, val error: String? = null)
+
+    @Serializable
+    private data class EventBatchResponse(val results: List<EventBatchResult> = emptyList())
+
     private val stringListSerializer = ListSerializer(String.serializer())
     private val queueSerializer = ListSerializer(QueuedPurchase.serializer())
+    private val eventQueueSerializer = ListSerializer(QueuedEvent.serializer())
 
     private fun cacheKey(cid: String) = "revnix.ent.$cid"
     private fun placementKey(key: String) = "revnix.placement.$key"
+    private fun placementFetchedAtKey(key: String) = "revnix.placementAt.$key"
     private fun installReportedKey(cid: String) = "revnix.installReported.$cid"
 
     /**
@@ -1439,6 +1597,12 @@ public class RevnixClient(private val config: RevnixConfig) {
         }.getOrElse { emptyList() }
     }
 
+    private fun stampedQueuedItems(now: Long): List<QueuedPurchase> {
+        val items = queuedItems()
+        if (items.none { it.queuedAt == null }) return items
+        return items.map { it.copy(queuedAt = it.queuedAt ?: now) }.also { persistQueue(it) }
+    }
+
     private fun persistQueue(items: List<QueuedPurchase>) {
         config.storage.set(KEY_QUEUE, json.encodeToString(queueSerializer, items))
     }
@@ -1447,8 +1611,10 @@ public class RevnixClient(private val config: RevnixConfig) {
         val items = queuedItems()
         val key = queueKey(input)
         if (items.any { it.key == key }) return
+        val overflow = items.size - PURCHASE_QUEUE_CAP + 1
+        if (overflow > 0) diagnostic("purchaseQueue", "dropped $overflow oldest")
         persistQueue(
-            items + QueuedPurchase(
+            items.drop(overflow.coerceAtLeast(0)) + QueuedPurchase(
                 key = key,
                 source = input.source.wire,
                 token = input.token,
@@ -1458,12 +1624,67 @@ public class RevnixClient(private val config: RevnixConfig) {
                 expiresAt = input.expiresAt,
                 signedTransactionInfo = input.signedTransactionInfo,
                 rawPayload = input.rawPayload,
+                queuedAt = config.now(),
             )
         )
     }
 
     private fun removeQueued(key: String) {
         persistQueue(queuedItems().filterNot { it.key == key })
+    }
+
+    private fun queuedEvents(): List<QueuedEvent> {
+        val raw = config.storage.get(KEY_EVENT_QUEUE) ?: return emptyList()
+        return runCatching { json.decodeFromString(eventQueueSerializer, raw) }.getOrElse { emptyList() }
+    }
+
+    private fun persistEvents(items: List<QueuedEvent>) {
+        config.storage.set(KEY_EVENT_QUEUE, json.encodeToString(eventQueueSerializer, items))
+    }
+
+    private fun enqueueEvent(path: String, body: JsonObject) {
+        var dropped = 0
+        val size = synchronized(eventQueueLock) {
+            val items = queuedEvents()
+            dropped = (items.size - EVENT_QUEUE_CAP + 1).coerceAtLeast(0)
+            persistEvents(items.drop(dropped) + QueuedEvent(path, body))
+            items.size - dropped + 1
+        }
+        if (dropped > 0) diagnostic("eventQueue", "dropped $dropped oldest")
+        if (size >= EVENT_FLUSH_AT) {
+            scope.launch { flushEvents() }
+            return
+        }
+        armFlushTimer(EVENT_FLUSH_DELAY_MS)
+    }
+
+    private fun armFlushTimer(delayMs: Long) {
+        synchronized(eventQueueLock) {
+            if (eventFlushTimer?.isActive != true) {
+                eventFlushTimer = scope.launch {
+                    delay(delayMs)
+                    synchronized(eventQueueLock) { eventFlushTimer = null }
+                    flushEvents()
+                }
+            }
+        }
+    }
+
+    private fun removeEvents(sent: List<QueuedEvent>) {
+        synchronized(eventQueueLock) {
+            val remaining = queuedEvents().toMutableList()
+            sent.forEach { remaining.remove(it) }
+            persistEvents(remaining)
+        }
+    }
+
+    private fun reportRejectedEvents(results: List<EventBatchResult>, chunk: List<QueuedEvent>) {
+        results.forEachIndexed { index, result ->
+            if (result.status >= 400) {
+                val eventId = chunk.getOrNull(index)?.body?.get("eventId")?.jsonPrimitive?.contentOrNull
+                diagnostic("eventQueue", "dropped $eventId: ${result.status} ${result.error.orEmpty()}")
+            }
+        }
     }
 
     /**

@@ -327,6 +327,7 @@ class RevnixClientTest {
         assertEquals(1, client.pendingPurchaseCount())
         // Persisted under the documented key, keyed source:token:transactionId.
         assertTrue(storage.get("revnix.pendingPurchases")!!.contains("apple:orig.1:txn.1"))
+        assertNull(storage.get("revnix.placementsInvalidatedAt"))
 
         // A later launch with connectivity drains it (idempotent server-side
         // via the shared purchaseKey). A FRESH client proves the queue
@@ -335,6 +336,7 @@ class RevnixClientTest {
         val relaunched = makeClient(storage = storage)
         assertEquals(1, relaunched.retryPendingPurchases())
         assertEquals(0, relaunched.pendingPurchaseCount())
+        assertTrue(storage.get("revnix.placementsInvalidatedAt") != null)
     }
 
     @Test
@@ -344,6 +346,54 @@ class RevnixClientTest {
         runCatching { client.registerPurchase(purchase) }
         runCatching { client.registerPurchase(purchase) }
         assertEquals(1, client.pendingPurchaseCount())
+    }
+
+    private fun seededPurchase(id: String, queuedAt: Long?) =
+        """{"key":"apple:seed:$id","source":"apple","token":"seed","productId":"pro.monthly","transactionId":"$id"""" +
+            (queuedAt?.let { ""","queuedAt":$it}""" } ?: "}")
+
+    @Test
+    fun `the purchase queue is capped at 100, dropping the oldest`() = runBlocking {
+        route("/purchases" to { disconnect() })
+        val storage = MemoryStorage()
+        storage.set(
+            "revnix.pendingPurchases",
+            (0 until 100).joinToString(",", "[", "]") { seededPurchase("q$it", 1_700_000_000_000) },
+        )
+        val diagnostics = mutableListOf<RevnixDiagnostic>()
+        val client = makeClient(storage = storage, onDiagnostic = { diagnostics += it })
+
+        runCatching { client.registerPurchase(purchase) }
+
+        assertEquals(100, client.pendingPurchaseCount())
+        val stored = storage.get("revnix.pendingPurchases")!!
+        assertFalse(stored.contains("apple:seed:q0\""))
+        assertTrue(stored.contains("apple:seed:q1\""))
+        assertTrue(stored.contains("apple:orig.1:txn.1"))
+        assertTrue(diagnostics.any { it.op == "purchaseQueue" })
+    }
+
+    @Test
+    fun `queued purchases expire after 30 days and unstamped ones count from now`() = runBlocking {
+        route("/purchases" to { disconnect() })
+        val clock = TestClock(1_700_000_000_000L)
+        val storage = MemoryStorage()
+        storage.set(
+            "revnix.pendingPurchases",
+            "[${seededPurchase("old", clock.now() - 31 * dayMs)},${seededPurchase("legacy", null)}]",
+        )
+        val diagnostics = mutableListOf<RevnixDiagnostic>()
+        val client = makeClient(now = clock::now, storage = storage, onDiagnostic = { diagnostics += it })
+
+        assertEquals(0, client.retryPendingPurchases())
+        assertEquals(1, client.pendingPurchaseCount())
+        assertTrue(storage.get("revnix.pendingPurchases")!!.contains("\"queuedAt\":${clock.now()}"))
+        assertTrue(diagnostics.any { it.message == "expired apple:seed:old" })
+
+        clock.advance(31 * dayMs)
+        assertEquals(0, client.retryPendingPurchases())
+        assertEquals(0, client.pendingPurchaseCount())
+        assertTrue(diagnostics.any { it.message == "expired apple:seed:legacy" })
     }
 
     @Test
@@ -382,6 +432,22 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `with a cached snapshot the entitlements fetch is capped at 3 s and serves the cache`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody)) {
+            json(200, entitlementsBody).setHeadersDelay(6, java.util.concurrent.TimeUnit.SECONDS)
+        })
+        val client = makeClient(entitlementsTtl = Duration.ZERO)
+        client.entitlements()
+
+        val started = System.currentTimeMillis()
+        val snapshot = client.entitlements()
+        val elapsed = System.currentTimeMillis() - started
+
+        assertEquals(true, snapshot.stale)
+        assertTrue(elapsed in 2_500..5_000, "took ${elapsed}ms")
+    }
+
+    @Test
     fun `isEntitled still serves the cache on a transient failure`() = runBlocking {
         route("/entitlements" to onceThen(json(200, entitlementsBody)) {
             json(503, """{"error":"unavailable"}""")
@@ -396,10 +462,124 @@ class RevnixClientTest {
         route("/placements" to onceThen(json(200, placementBody)) {
             json(404, """{"error":"unknown placement"}""")
         })
-        val client = makeClient()
-        client.resolvePlacement("main") // cached
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+        client.resolvePlacement("main")
+        assertEquals("off_1", client.resolvePlacement("main").offering.offeringId)
+        awaitCondition { storage.get("revnix.placement.main") == null }
         assertFailsWith<RevnixError.NotFound> { client.resolvePlacement("main") }
         Unit
+    }
+
+    @Test
+    fun `a cached placement under 24 h answers first and refreshes in the background, an older one goes to the network`() =
+        runBlocking {
+            route("/placements" to onceThen(json(200, placementBody)) { json(200, placementExperimentBody) })
+            val storage = MemoryStorage()
+            val clock = TestClock(1_700_000_000_000L)
+            val client = makeClient(now = clock::now, storage = storage)
+
+            assertEquals(1, client.resolvePlacement("main").revision)
+            clock.advance(23 * 3600_000L)
+            assertEquals(1, client.resolvePlacement("main").revision)
+            awaitCondition { storage.get("revnix.placement.main").orEmpty().contains("var_b") }
+            assertEquals(3, client.resolvePlacement("main").revision)
+
+            val storage2 = MemoryStorage()
+            val clock2 = TestClock(1_700_000_000_000L)
+            val client2 = makeClient(now = clock2::now, storage = storage2)
+            client2.resolvePlacement("main")
+            clock2.advance(25 * 3600_000L)
+            route("/placements" to { json(404, """{"error":"unknown placement"}""") })
+            assertFailsWith<RevnixError.NotFound> { client2.resolvePlacement("main") }
+            Unit
+        }
+
+    @Test
+    fun `a cached placement is not served first for another customer, after setAttributes, or after a purchase`() = runBlocking {
+        val resolves = AtomicInteger(0)
+        route(
+            "/placements" to { resolves.incrementAndGet(); json(200, placementBody) },
+            "/attributes" to { json(200, "{}") },
+        )
+        val clock = TestClock(1_700_000_000_000L)
+        val client = makeClient(now = clock::now)
+
+        client.resolvePlacement("main")
+        client.logout()
+        client.resolvePlacement("main")
+        assertEquals(2, resolves.get())
+
+        clock.advance(1)
+        client.setAttributes(mapOf("country" to "PK"))
+        client.resolvePlacement("main")
+        assertEquals(3, resolves.get())
+
+        val cid = client.customerId()
+        route(
+            "/placements" to { resolves.incrementAndGet(); json(200, placementBody) },
+            "/purchases" to { json(201, purchaseBody.replace("cust_1", cid)) },
+        )
+        clock.advance(1)
+        client.registerPurchase(purchase)
+        client.resolvePlacement("main")
+        assertEquals(4, resolves.get())
+    }
+
+    @Test
+    fun `a refresh in flight when placements are invalidated is not served cache-first afterwards`() = runBlocking {
+        val resolves = AtomicInteger(0)
+        val refreshStarted = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        route(
+            "/placements" to {
+                if (resolves.incrementAndGet() == 2) {
+                    refreshStarted.countDown()
+                    release.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                }
+                json(200, placementBody)
+            },
+            "/attributes" to { json(200, "{}") },
+        )
+        val storage = MemoryStorage()
+        val clock = TestClock(1_700_000_000_000L)
+        val client = makeClient(now = clock::now, storage = storage)
+
+        client.resolvePlacement("main")
+        clock.advance(1)
+        client.resolvePlacement("main")
+        assertTrue(refreshStarted.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        clock.advance(1)
+        client.setAttributes(mapOf("country" to "PK"))
+        release.countDown()
+        awaitCondition { storage.get("revnix.placementAt.main").orEmpty().contains("1700000000001") }
+
+        client.resolvePlacement("main")
+        assertEquals(3, resolves.get())
+    }
+
+    @Test
+    fun `preload fetches every key into the cache and skips the ones that fail`() = runBlocking {
+        route(
+            "/placements/main" to { json(200, placementBody) },
+            "/placements/gone" to { json(404, """{"error":"unknown placement"}""") },
+        )
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+
+        val resolved = client.preload(listOf("main", "gone"))
+
+        assertEquals(listOf("main"), resolved.map { it.placementKey })
+        assertNotNull(storage.get("revnix.placement.main"))
+        assertNull(storage.get("revnix.placement.gone"))
+    }
+
+    private fun awaitCondition(timeoutMs: Long = 2000, condition: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!condition()) {
+            assertTrue(System.currentTimeMillis() < deadline, "condition not met in ${timeoutMs}ms")
+            Thread.sleep(10)
+        }
     }
 
     // MARK: - Paywall config decoding (REV-028 templates)
@@ -1307,6 +1487,8 @@ class RevnixClientTest {
         val client = makeClient()
         val viewId = client.logPaywallDisplay(REVNIX_PREVIEW_PLACEMENT_KEY, "pw_preview")
         assertNotNull(viewId)
+        client.logPaywallEvent(RevnixPaywallEvent.Restore, viewId, placementKey = REVNIX_PREVIEW_PLACEMENT_KEY)
+        client.flushEvents()
         assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
 
@@ -1344,38 +1526,207 @@ class RevnixClientTest {
         assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
 
-    @Test
-    fun `track posts the beacon, and an invalid event name sends nothing`() = runBlocking {
-        route("v1/events" to { json(200, "{}") })
-        val client = makeClient()
+    private fun batchEvents(request: RecordedRequest) =
+        requestBody(request)["events"]!!.jsonArray.map { it.jsonObject }
 
-        client.track(
-            event = "level_up",
-            properties = mapOf("level" to 5, "vip" to true, "source" to "menu"),
-            eventId = "evt_1",
-        )
+    private fun queuedEventCount(storage: RevnixStorage) =
+        kotlinx.serialization.json.Json.parseToJsonElement(storage.get("revnix.eventQueue") ?: "[]").jsonArray.size
+
+    @Test
+    fun `track queues the event, flushEvents sends it as a batch, and an invalid event name queues nothing`() =
+        runBlocking {
+            route("v1/events" to { json(200, """{"results":[{"status":201}]}""") })
+            val client = makeClient()
+
+            client.track(
+                event = "level_up",
+                properties = mapOf("level" to 5, "vip" to true, "source" to "menu"),
+                eventId = "evt_1",
+            )
+            client.flushEvents()
+
+            val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+            assertEquals("POST", request.method)
+            assertEquals("/v1/events", request.path)
+            val body = batchEvents(request).single()
+            assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
+            assertEquals("level_up", body["event"]!!.jsonPrimitive.content)
+            assertEquals("evt_1", body["eventId"]!!.jsonPrimitive.content)
+            assertTrue(body["occurredAt"]!!.jsonPrimitive.content.toLong() > 0)
+            val properties = body["properties"]!!.jsonObject
+            assertEquals(5, properties["level"]!!.jsonPrimitive.content.toInt())
+            assertEquals(true, properties["vip"]!!.jsonPrimitive.content.toBoolean())
+            assertEquals("menu", properties["source"]!!.jsonPrimitive.content)
+
+            client.track(event = "level_up", properties = mapOf("score" to Double.NaN, "level" to 6))
+            client.flushEvents()
+            val second = batchEvents(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!).single()
+            assertTrue(second["eventId"]!!.jsonPrimitive.content.isNotEmpty())
+            assertNull(second["properties"]!!.jsonObject["score"])
+            assertEquals(6, second["properties"]!!.jsonObject["level"]!!.jsonPrimitive.content.toInt())
+
+            client.track(event = "Level Up")
+            client.flushEvents()
+            assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+        }
+
+    @Test
+    fun `three tracks flush as one POST carrying all three events`() = runBlocking {
+        route("v1/events" to { json(200, """{"results":[{"status":201},{"status":201},{"status":200}]}""") })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+
+        client.track("a", eventId = "e1")
+        client.track("b", eventId = "e2")
+        client.track("c", eventId = "e3")
+        client.flushEvents()
 
         val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
-        assertEquals("POST", request.method)
+        assertEquals(listOf("e1", "e2", "e3"), batchEvents(request).map { it["eventId"]!!.jsonPrimitive.content })
+        assertEquals(1, server.requestCount)
+        assertEquals(0, queuedEventCount(storage))
+    }
+
+    @Test
+    fun `paywall events batch on their own route with eventId defaulting to the view id`() = runBlocking {
+        route("v1/paywalls/events" to { json(200, """{"results":[{"status":201},{"status":201}]}""") })
+        val client = makeClient()
+
+        client.logPaywallEvent(RevnixPaywallEvent.Restore, viewId = "view_1", paywallId = "pw_1")
+        client.logPaywallEvent(RevnixPaywallEvent.Selected, viewId = "view_1", eventId = "sel:pkg_1")
+        client.flushEvents()
+
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals("/v1/paywalls/events", request.path)
+        val events = batchEvents(request)
+        assertEquals(listOf("view_1", "sel:pkg_1"), events.map { it["eventId"]!!.jsonPrimitive.content })
+        assertTrue(events.all { it["occurredAt"]!!.jsonPrimitive.content.toLong() > 0 })
+    }
+
+    @Test
+    fun `a retryable flush failure keeps the queue, holds 30 s, and a later flush delivers`() = runBlocking {
+        route("v1/events" to onceThen(json(503, """{"error":"unavailable"}""")) {
+            json(200, """{"results":[{"status":201}]}""")
+        })
+        val storage = MemoryStorage()
+        val clock = TestClock(1_700_000_000_000L)
+        val client = makeClient(now = clock::now, storage = storage)
+
+        client.track("a", eventId = "e1")
+        client.flushEvents()
+        assertEquals(1, queuedEventCount(storage))
+
+        client.flushEvents()
+        assertEquals(1, server.requestCount)
+
+        clock.advance(31_000)
+        client.flushEvents()
+        assertEquals(2, server.requestCount)
+        assertEquals(0, queuedEventCount(storage))
+    }
+
+    @Test
+    fun `a non-JSON 200 from the batch route keeps the queue`() = runBlocking {
+        route("v1/events" to { MockResponse().setResponseCode(200).setBody("<html>portal</html>") })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+
+        client.track("a", eventId = "e1")
+        client.flushEvents()
+
+        assertEquals(1, server.requestCount)
+        assertEquals(1, queuedEventCount(storage))
+    }
+
+    @Test
+    fun `a per-item rejection is dropped with a diagnostic and the accepted ones are removed`() = runBlocking {
+        route("v1/events" to {
+            json(200, """{"results":[{"status":201},{"status":400,"error":"bad"},{"status":200}]}""")
+        })
+        val storage = MemoryStorage()
+        val diagnostics = mutableListOf<RevnixDiagnostic>()
+        val client = makeClient(storage = storage, onDiagnostic = { diagnostics += it })
+
+        client.track("a", eventId = "e1")
+        client.track("b", eventId = "e2")
+        client.track("c", eventId = "e3")
+        client.flushEvents()
+
+        assertEquals(0, queuedEventCount(storage))
+        assertEquals(
+            listOf("dropped e2: 400 bad"),
+            diagnostics.filter { it.op == "eventQueue" }.map { it.message },
+        )
+    }
+
+    @Test
+    fun `an event queued while a flush is in flight survives it`() = runBlocking {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        route("v1/events" to {
+            entered.countDown()
+            release.await(2, java.util.concurrent.TimeUnit.SECONDS)
+            json(200, """{"results":[{"status":201}]}""")
+        })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+
+        client.track("a", eventId = "e1")
+        val flush = async(kotlinx.coroutines.Dispatchers.IO) { client.flushEvents() }
+        assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        client.track("b", eventId = "e2")
+        release.countDown()
+        flush.await()
+
+        assertTrue(storage.get("revnix.eventQueue")!!.contains("\"e2\""))
+        assertEquals(1, queuedEventCount(storage))
+    }
+
+    @Test
+    fun `the event queue is capped at 1000, dropping the oldest`() = runBlocking {
+        route("v1/events" to { json(503, """{"error":"unavailable"}""") })
+        val storage = MemoryStorage()
+        storage.set(
+            "revnix.eventQueue",
+            (0 until 1000).joinToString(",", "[", "]") {
+                """{"path":"v1/events","body":{"event":"seed","eventId":"s$it"}}"""
+            },
+        )
+        val diagnostics = mutableListOf<RevnixDiagnostic>()
+        val client = makeClient(storage = storage, onDiagnostic = { diagnostics += it })
+
+        client.track("a", eventId = "newest")
+
+        val ids = kotlinx.serialization.json.Json.parseToJsonElement(storage.get("revnix.eventQueue")!!).jsonArray
+            .map { it.jsonObject["body"]!!.jsonObject["eventId"]!!.jsonPrimitive.content }
+        assertEquals(1000, ids.size)
+        assertEquals("s1", ids.first())
+        assertEquals("newest", ids.last())
+        assertTrue(diagnostics.any { it.op == "eventQueue" && it.message == "dropped 1 oldest" })
+    }
+
+    @Test
+    fun `events left from the previous launch are flushed shortly after init`() = runBlocking {
+        route("v1/events" to { json(200, """{"results":[{"status":201}]}""") })
+        val storage = MemoryStorage()
+        storage.set("revnix.eventQueue", """[{"path":"v1/events","body":{"event":"seed","eventId":"left"}}]""")
+        makeClient(storage = storage)
+
+        val request = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals("left", batchEvents(request).single()["eventId"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `going to the background flushes the queue even with implicit placements off`() = runBlocking {
+        route("v1/events" to { json(200, """{"results":[{"status":201}]}""") })
+        val (lifecycle, handler) = fakeLifecycle()
+        val client = makeClient(lifecycle = lifecycle)
+
+        client.track("a", eventId = "e1")
+        handler()!!.invoke(RevnixAppState.BACKGROUND)
+
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
         assertEquals("/v1/events", request.path)
-        val body = requestBody(request)
-        assertEquals(client.customerId(), body["customerId"]!!.jsonPrimitive.content)
-        assertEquals("level_up", body["event"]!!.jsonPrimitive.content)
-        assertEquals("evt_1", body["eventId"]!!.jsonPrimitive.content)
-        assertTrue(body["occurredAt"]!!.jsonPrimitive.content.toLong() > 0)
-        val properties = body["properties"]!!.jsonObject
-        assertEquals(5, properties["level"]!!.jsonPrimitive.content.toInt())
-        assertEquals(true, properties["vip"]!!.jsonPrimitive.content.toBoolean())
-        assertEquals("menu", properties["source"]!!.jsonPrimitive.content)
-
-        client.track(event = "level_up", properties = mapOf("score" to Double.NaN, "level" to 6))
-        val second = requestBody(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!)
-        assertTrue(second["eventId"]!!.jsonPrimitive.content.isNotEmpty())
-        assertNull(second["properties"]!!.jsonObject["score"])
-        assertEquals(6, second["properties"]!!.jsonObject["level"]!!.jsonPrimitive.content.toInt())
-
-        client.track(event = "Level Up")
-        assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
     }
 
     @Test

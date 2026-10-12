@@ -25,7 +25,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Outline
 import android.graphics.Paint
@@ -58,8 +57,6 @@ import com.revnix.revnixBackgroundBaseColor
 import com.revnix.revnixBlockColor
 import com.revnix.revnixDeviceLocale
 import com.revnix.revnixSelectedPackageId
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -298,6 +295,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
     init {
         clipChildren = false
         clipToPadding = false
+        RevnixImageLoader.init(context)
     }
 
     /**
@@ -1413,10 +1411,6 @@ public class RevnixPaywallView @JvmOverloads constructor(
         for (applier in selectionAppliers) applier(selectedId)
     }
 
-    // ——— hero image fetch: plain HttpURLConnection + BitmapFactory on a
-    // background dispatcher, cancelled on detach, decoded bitmap cached
-    // per URL so relayouts and rebinds never refetch. ———
-
     private fun attachHero(target: ImageView, url: String) {
         heroImageView = target
         val cached = heroBitmap
@@ -1432,20 +1426,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         heroFetchJob?.cancel()
         heroFetchUrl = url
         heroFetchJob = viewScope.launch(Dispatchers.IO) {
-            val bitmap = runCatching {
-                val connection = URL(url).openConnection() as HttpURLConnection
-                connection.connectTimeout = 10_000
-                connection.readTimeout = 10_000
-                try {
-                    if (connection.responseCode in 200..299) {
-                        connection.inputStream.use { BitmapFactory.decodeStream(it) }
-                    } else {
-                        null
-                    }
-                } finally {
-                    connection.disconnect()
-                }
-            }.getOrNull()
+            val bitmap = runCatching { RevnixImageLoader.fetch(url, 0, 0) }.getOrNull()
             withContext(Dispatchers.Main) {
                 if (bitmap != null && heroFetchUrl == url) {
                     heroBitmap = bitmap

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- `flushEvents()` sends queued `track` and paywall interaction events now; `preload(placementKeys)` warms the placement cache, and `RevnixClient.preload(context, placementKeys)` in `revnix-android` also downloads the paywalls' images to disk.
+
+### Changed
+
+- `track` and `logPaywallEvent` queue events on device and send them in batches of up to 100 (at 20 queued, 10 s after an event, on app background, and after launch), so offline events are no longer lost. The queue holds at most 1000 events.
+- `resolvePlacement` answers from a cache up to 24 h old for the same customer and refreshes it in the background.
+- Paywall images are cached on disk under the app's cache directory.
+- Entitlements with a cached snapshot wait at most 3 s for the network; HTTP connects time out after 5 s.
+- `AndroidStorage` and `FileStorage` no longer read from disk in their constructors.
+- The purchase retry queue holds at most 100 purchases and drops ones older than 30 days.
+
 ## 1.5.0 (2026-10-09)
 
 ### Added

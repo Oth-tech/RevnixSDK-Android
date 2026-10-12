@@ -37,12 +37,14 @@ public class MemoryStorage : RevnixStorage {
 public class FileStorage(private val file: File) : RevnixStorage {
     private val lock = Any()
     private val json = Json { ignoreUnknownKeys = true }
-    private val values: MutableMap<String, String> = runCatching {
-        json.decodeFromString(
-            MapSerializer(String.serializer(), String.serializer()),
-            file.readText(),
-        ).toMutableMap()
-    }.getOrElse { mutableMapOf() }
+    private val values: MutableMap<String, String> by lazy {
+        runCatching {
+            json.decodeFromString(
+                MapSerializer(String.serializer(), String.serializer()),
+                file.readText(),
+            ).toMutableMap()
+        }.getOrElse { mutableMapOf() }
+    }
 
     override fun get(key: String): String? = synchronized(lock) { values[key] }
 
