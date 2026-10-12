@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.6.0 (2026-10-12)
+
 ### Added
 
 - `flushEvents()` sends queued `track` and paywall interaction events now; `preload(placementKeys)` warms the placement cache, and `RevnixClient.preload(context, placementKeys)` in `revnix-android` also downloads the paywalls' images to disk.
