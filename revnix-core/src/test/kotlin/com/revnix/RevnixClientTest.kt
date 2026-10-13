@@ -1,5 +1,6 @@
 package com.revnix
 
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -110,6 +111,7 @@ class RevnixClientTest {
         onAttribution: ((RevnixAttribution) -> Unit)? = null,
         lifecycle: RevnixLifecycle? = null,
         deviceIntegrity: (suspend (String) -> String?)? = null,
+        advertisingId: (suspend () -> String?)? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
             apiKey = "rvx_pk_test_abc",
@@ -130,6 +132,7 @@ class RevnixClientTest {
             onDeferredDeepLink = onDeferredDeepLink,
             onAttribution = onAttribution,
             deviceIntegrity = deviceIntegrity,
+            advertisingId = advertisingId,
         )
     ).also { clients += it }
 
@@ -729,6 +732,51 @@ class RevnixClientTest {
         client.registerInstall()
         val body = requestBody(server.takeRequest())
         assertNull(body["integrity"])
+    }
+
+    @Test
+    fun `registerInstall stores the advertising id once and deletes it after an opt-out`() = runBlocking {
+        val sent = Collections.synchronizedList(mutableListOf<String>())
+        route(
+            "v1/installs" to { json(200, "{}") },
+            "/attributes" to { sent += requestBody(it)["attributes"].toString(); json(200, "{}") },
+            "v1/customers" to { json(200, "{}") },
+        )
+        val storage = MemoryStorage()
+        var adId: String? = null
+
+        suspend fun launch(source: suspend () -> String?) =
+            makeClient(storage = storage, advertisingId = source).also {
+                it.registerInstall()
+                it.advertisingIdJob!!.join()
+            }
+
+        launch { adId }
+        assertEquals(emptyList<String>(), sent)
+
+        adId = "38400000-8cf0-11bd-b23e-10b96e40000d"
+        launch { adId }
+        launch { adId }
+        assertEquals(listOf("""{"gps_adid":"38400000-8cf0-11bd-b23e-10b96e40000d"}"""), sent)
+
+        launch { throw java.io.IOException("play services updating") }
+        assertEquals(1, sent.size)
+
+        adId = null
+        launch { adId }
+        assertEquals("""{"gps_adid":null}""", sent.last())
+        assertEquals(2, sent.size)
+    }
+
+    @Test
+    fun `a slow advertising id source never delays the install report`() = runBlocking {
+        route("v1/installs" to { json(200, "{}") }, "v1/customers" to { json(200, "{}") })
+        val client = makeClient(advertisingId = { kotlinx.coroutines.awaitCancellation() })
+
+        client.registerInstall()
+
+        assertTrue(server.takeRequest().path!!.contains("v1/installs"))
+        assertTrue(client.advertisingIdJob!!.isActive)
     }
 
     @Test

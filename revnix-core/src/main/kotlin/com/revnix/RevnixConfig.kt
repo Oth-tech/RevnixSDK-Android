@@ -124,6 +124,13 @@ public data class RevnixConfig(
      * `playIntegrity(context)` from revnix-android.
      */
     val deviceIntegrity: (suspend (nonce: String) -> String?)? = null,
+    /**
+     * Google Advertising ID source, stored on the customer as `gps_adid` after
+     * [RevnixClient.registerInstall]. Pass `googleAdvertisingId(context)` from
+     * revnix-android. Null from the source (the user opted out) deletes a
+     * previously stored `gps_adid`; a throw or a 10 s timeout changes nothing.
+     */
+    val advertisingId: (suspend () -> String?)? = null,
 ) {
     /**
      * REV-272: the rule the client reads — [implicitPlacements] when set, else

@@ -14,6 +14,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -23,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.Serializable
@@ -86,6 +88,7 @@ public class RevnixClient(private val config: RevnixConfig) {
     private val integrityMutex = Mutex()
     private var integrityDeferred: Deferred<String?>? = null
     private var integrityDeferredCid: String? = null
+    internal var advertisingIdJob: Job? = null
 
     /**
      * REV-268: the encoded X-Revnix-Device value, built on the first resolve and
@@ -179,6 +182,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         private const val KEY_ATTRIBUTION = "revnix.attribution"
         private const val KEY_LAST_ATTRIBUTION = "revnix.lastAttribution"
         private const val KEY_LAST_PUSH_TOKEN = "revnix.lastPushToken"
+        private const val KEY_LAST_AD_ID = "revnix.lastAdId"
         private const val KEY_SESSION_STARTED_AT = "revnix.sessionStartedAt"
         private const val KEY_LAST_BACKGROUND_AT = "revnix.lastBackgroundAt"
 
@@ -567,6 +571,35 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     /** Fire-and-forget install beacon; once per customer id. */
     public suspend fun registerInstall(platform: String? = null, appVersion: String? = null) {
+        postInstall(platform, appVersion)
+        val source = config.advertisingId ?: return
+        advertisingIdJob = scope.launch { reportAdvertisingId(source) }
+    }
+
+    private suspend fun reportAdvertisingId(source: suspend () -> String?) {
+        val id = try {
+            withTimeout(10_000) { source() }
+        } catch (err: TimeoutCancellationException) {
+            return
+        } catch (err: CancellationException) {
+            throw err
+        } catch (err: Throwable) {
+            diagnostic("advertisingId", err.message.orEmpty())
+            return
+        }
+        val stored = config.storage.get(KEY_LAST_AD_ID)
+        val payload = listOf(customerId(), id.orEmpty()).joinToString("\u0001")
+        if (payload == stored || (id == null && stored == null)) return
+        try {
+            setAttributes(mapOf("gps_adid" to id))
+            config.storage.set(KEY_LAST_AD_ID, payload)
+        } catch (err: RevnixError) {
+            bgFailures += 1
+            diagnostic("advertisingId", err.message.orEmpty())
+        }
+    }
+
+    private suspend fun postInstall(platform: String?, appVersion: String?) {
         val cid = customerId()
         if (config.storage.get(installReportedKey(cid)) != null) return
         val body = buildJsonObject {
