@@ -36,27 +36,37 @@ import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Path
+import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.WindowInsets
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import android.widget.GridLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import com.revnix.BlockAction
+import com.revnix.BlockDimension
 import com.revnix.BlockPackage
 import com.revnix.BlockSelectionContext
 import com.revnix.BlockStyle
@@ -79,6 +89,9 @@ import com.revnix.revnixIsBlockVisible
 import com.revnix.revnixPackageContext
 import com.revnix.revnixParseCssGradients
 import com.revnix.revnixResolveTags
+import com.revnix.revnixTimerRemaining
+import com.revnix.revnixTimerText
+import com.revnix.revnixToggleState
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -126,6 +139,10 @@ internal class BlockContext(
      * paywall is rendering approximately.
      */
     val onDiagnostic: ((String) -> Unit)? = null,
+    val displayedAt: Long = System.currentTimeMillis(),
+    val carouselPages: MutableMap<String, Int> = mutableMapOf(),
+    /** Each video's playback position in ms by block id, kept across selection rebuilds. */
+    val videoPositions: MutableMap<String, Int> = mutableMapOf(),
 )
 
 /**
@@ -349,6 +366,12 @@ internal class PaywallBlockRenderer(
                 if (block.flex != true) minimumHeight = dp(style?.height?.px ?: 16.0)
             }
 
+            is PaywallBlock.Timer -> timerView(block, style) ?: return null
+
+            is PaywallBlock.Video -> videoSlot(block, style)
+
+            is PaywallBlock.Toggle -> toggleRow(block, style, pkg) ?: return null
+
             // Handled above; listed so the `when` stays exhaustive.
             is PaywallBlock.Card -> return null
 
@@ -404,7 +427,11 @@ internal class PaywallBlockRenderer(
      * loaded. An empty URL falls back to the config's hero image, then to the
      * placeholder alone. `fit` and `shape` apply; `inset` fills a stack.
      */
-    private fun imageSlot(block: PaywallBlock.Image, style: BlockStyle?): View {
+    private fun imageSlot(
+        block: PaywallBlock.Image,
+        style: BlockStyle?,
+        url: String? = block.url?.takeIf { it.isNotBlank() } ?: ctx.heroImageUrl?.takeIf { it.isNotBlank() },
+    ): FrameLayout {
         // The 160dp default suits a slot dropped into a flow column; a
         // converted design sizes its own slot (pinned edges, explicit box),
         // and the default must not fight it. Same rule as the dashboard.
@@ -413,7 +440,6 @@ internal class PaywallBlockRenderer(
                 style.inset == true || style.height != null || style.aspectRatio != null ||
                     style.flex != null || (style.top != null && style.bottom != null)
                 )
-        val url = block.url?.takeIf { it.isNotBlank() } ?: ctx.heroImageUrl?.takeIf { it.isNotBlank() }
         val round = block.shape == "circle"
 
         val ratio = style?.aspectRatio?.ratio
@@ -464,6 +490,142 @@ internal class PaywallBlockRenderer(
         }
         applyStyle(slot, style)
         return slot
+    }
+
+    private fun timerView(block: PaywallBlock.Timer, style: BlockStyle?): View? {
+        fun text() = revnixTimerText(block, revnixTimerRemaining(block, ctx.displayedAt, System.currentTimeMillis()))
+        val view = textView(text() ?: return null, style)
+        repeatWhileAttached(view, 1000L) {
+            val next = text()
+            if (next == null) view.visibility = View.GONE else view.text = next
+        }
+        return view
+    }
+
+    private fun videoSlot(block: PaywallBlock.Video, style: BlockStyle?): View {
+        val slot = imageSlot(
+            PaywallBlock.Image(block.id, fit = block.fit, placeholder = ""), style,
+            url = block.poster?.takeIf { it.isNotBlank() },
+        )
+        if (block.url.isBlank()) return slot
+        val poster = (0 until slot.childCount).map { slot.getChildAt(it) }
+        val video = TextureView(context)
+        var player: MediaPlayer? = null
+        var surface: Surface? = null
+        video.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                val mp = MediaPlayer()
+                player = mp
+                surface = Surface(texture)
+                runCatching {
+                    mp.setSurface(surface)
+                    mp.setDataSource(block.url)
+                    mp.setVolume(0f, 0f)
+                    mp.isLooping = true
+                    mp.setOnPreparedListener {
+                        ctx.videoPositions[block.id]?.let(it::seekTo)
+                        it.start()
+                    }
+                    mp.setOnVideoSizeChangedListener { _, w, h -> fitVideo(video, w, h, block.fit == "contain") }
+                    mp.setOnInfoListener { _, what, _ ->
+                        if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) poster.forEach { it.visibility = View.GONE }
+                        false
+                    }
+                    mp.setOnErrorListener { _, _, _ ->
+                        ctx.onDiagnostic?.invoke("video not played: ${block.url}")
+                        true
+                    }
+                    mp.prepareAsync()
+                }.onFailure { ctx.onDiagnostic?.invoke("video not played: ${block.url}") }
+            }
+
+            override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+                player?.let { fitVideo(video, it.videoWidth, it.videoHeight, block.fit == "contain") }
+            }
+
+            override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                player?.let { mp -> runCatching { ctx.videoPositions[block.id] = mp.currentPosition } }
+                player?.release()
+                surface?.release()
+                player = null
+                surface = null
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+        }
+        slot.addView(video, revnixFillParams())
+        return slot
+    }
+
+    private fun fitVideo(view: TextureView, videoWidth: Int, videoHeight: Int, contain: Boolean) {
+        val w = view.width.toFloat()
+        val h = view.height.toFloat()
+        if (w <= 0f || h <= 0f || videoWidth <= 0 || videoHeight <= 0) return
+        val scale = if (contain) min(w / videoWidth, h / videoHeight) else max(w / videoWidth, h / videoHeight)
+        view.setTransform(Matrix().apply { setScale(videoWidth * scale / w, videoHeight * scale / h, w / 2, h / 2) })
+    }
+
+    private fun toggleRow(block: PaywallBlock.Toggle, style: BlockStyle?, pkg: BlockPackage?): View? {
+        val (on, target) = revnixToggleState(block, ctx.packages, ctx.selectedPackageId) ?: return null
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val label = textView(revnixResolveTags(block.label, pkg, ctx.packages), style)
+        label.background = null
+        label.setPadding(0, 0, 0, 0)
+        label.alpha = 1f
+        label.rotation = 0f
+        row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val accent = revnixBlockColor(doc.accent, doc) ?: Color.BLUE
+        val ink = revnixBlockColor(doc.textColor, doc) ?: Color.WHITE
+        val checked = intArrayOf(android.R.attr.state_checked)
+        val toggle = Switch(context).apply {
+            isChecked = on
+            isClickable = false
+            isFocusable = false
+            thumbTintList = ColorStateList(arrayOf(checked, intArrayOf()), intArrayOf(accent, Color.rgb(236, 236, 236)))
+            trackTintList = ColorStateList(arrayOf(checked, intArrayOf()), intArrayOf(withAlpha(accent, 0.5), withAlpha(ink, 0.3)))
+        }
+        row.addView(
+            toggle,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { marginStart = dp(12.0) },
+        )
+        applyStyle(row, style)
+        toggle.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        row.contentDescription = label.text
+        row.accessibilityDelegate = object : View.AccessibilityDelegate() {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: AccessibilityNodeInfo) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                info.className = Switch::class.java.name
+                info.isCheckable = true
+                @Suppress("DEPRECATION")
+                info.isChecked = on
+            }
+        }
+        row.setOnClickListener { ctx.onSelect(target) }
+        return row
+    }
+
+    private fun repeatWhileAttached(view: View, periodMs: Long, tick: () -> Unit) {
+        val runnable = object : Runnable {
+            override fun run() {
+                tick()
+                view.postDelayed(this, periodMs)
+            }
+        }
+        view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                v.postDelayed(runnable, periodMs)
+            }
+
+            override fun onViewDetachedFromWindow(v: View) {
+                v.removeCallbacks(runnable)
+            }
+        })
     }
 
     private fun listColumn(block: PaywallBlock.ListBlock, style: BlockStyle?): View {
@@ -774,7 +936,11 @@ internal class PaywallBlockRenderer(
         // rather than drawn with unresolved tags.
         val sc = revnixCardContext(block, parent, ctx.packages, ctx.selectedPackageId) ?: return null
         if (!revnixIsBlockVisible(block, sc)) return null
-        val style = revnixEffectiveStyle(block, sc)
+        var style = revnixEffectiveStyle(block, sc)
+        if (block.layout == "carousel") {
+            if (style?.height?.px == null) style = (style ?: BlockStyle()).copy(height = BlockDimension(px = CAROUSEL_HEIGHT))
+            return Drawn(carousel(block, sc, style), style)
+        }
         val selects = if (block.packageIndex != null) sc.pkg?.packageId else null
         return Drawn(container(block, sc, style, selects), style)
     }
@@ -835,6 +1001,48 @@ internal class PaywallBlockRenderer(
         applyStyle(group, style)
         if (selects != null) group.setOnClickListener { ctx.onSelect(selects) }
         return group
+    }
+
+    private fun carousel(block: PaywallBlock.Card, sc: BlockSelectionContext, style: BlockStyle?): View {
+        val box = FrameLayout(context)
+        val pager = CarouselPager(context, ctx.carouselPages[block.id] ?: 0)
+        for (child in block.children) {
+            val drawn = render(child, sc) ?: continue
+            pager.strip.addView(drawn.view, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT))
+        }
+        box.addView(pager, revnixFillParams())
+        val count = pager.strip.childCount
+        if (count > 1) {
+            val accent = revnixBlockColor(doc.accent, doc) ?: Color.WHITE
+            val rest = withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.3)
+            val dots = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            repeat(count) { index ->
+                dots.addView(
+                    View(context).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL } },
+                    LinearLayout.LayoutParams(dp(6.0), dp(6.0)).apply { if (index > 0) marginStart = dp(6.0) },
+                )
+            }
+            fun paint(page: Int) {
+                for (i in 0 until count) (dots.getChildAt(i).background as GradientDrawable).setColor(if (i == page) accent else rest)
+            }
+            paint(pager.current)
+            pager.onPage = { page ->
+                ctx.carouselPages[block.id] = page
+                paint(page)
+            }
+            box.addView(
+                dots,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+                ).apply { bottomMargin = dp(8.0) },
+            )
+            block.autoAdvance?.takeIf { it > 0 }?.let { seconds ->
+                repeatWhileAttached(pager, seconds * 1000L) { if (!pager.dragging) pager.show((pager.current + 1) % count) }
+            }
+        }
+        applyStyle(box, style)
+        return box
     }
 
     private fun gridColumnCount(block: PaywallBlock.Card): Int {
@@ -1122,6 +1330,8 @@ internal class PaywallBlockRenderer(
 
         /** The fallback close chip's distance from the top and trailing edges, in dp. */
         const val CLOSE_INSET = 14.0
+
+        const val CAROUSEL_HEIGHT = 220.0
     }
 }
 
@@ -1198,6 +1408,71 @@ private class InsetRequestingFrame(context: Context) : FrameLayout(context) {
         super.onAttachedToWindow()
         requestApplyInsets()
     }
+}
+
+private class CarouselPager(context: Context, var current: Int) : HorizontalScrollView(context) {
+    val strip = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+    var onPage: ((Int) -> Unit)? = null
+    var dragging = false
+        private set
+    private var startPage = 0
+    private var laidWidth = 0
+
+    init {
+        isHorizontalScrollBarEnabled = false
+        overScrollMode = OVER_SCROLL_NEVER
+        addView(strip, LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
+
+    fun show(page: Int) {
+        if (width > 0) smoothScrollTo(page.coerceIn(0, max(0, strip.childCount - 1)) * width, 0)
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val pageWidth = MeasureSpec.getSize(widthMeasureSpec)
+        for (i in 0 until strip.childCount) strip.getChildAt(i).layoutParams.width = pageWidth
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        super.onLayout(changed, l, t, r, b)
+        if (r - l != laidWidth) {
+            laidWidth = r - l
+            scrollTo(current * laidWidth, 0)
+        }
+    }
+
+    override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
+        super.onScrollChanged(l, t, oldl, oldt)
+        if (width <= 0) return
+        val page = ((l + width / 2) / width).coerceIn(0, max(0, strip.childCount - 1))
+        if (page != current) {
+            current = page
+            onPage?.invoke(page)
+        }
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            dragging = true
+            startPage = current
+        }
+        val handled = super.dispatchTouchEvent(ev)
+        if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+            dragging = false
+            val dx = scrollX - startPage * width
+            show(
+                when {
+                    dx > width / 5 -> startPage + 1
+                    dx < -width / 5 -> startPage - 1
+                    else -> startPage
+                },
+            )
+        }
+        return handled
+    }
+
+    override fun fling(velocityX: Int) = Unit
 }
 
 /** A box that keeps the design's aspect ratio when nothing fixes its height. */

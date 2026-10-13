@@ -231,5 +231,8 @@ class PaywallSelectionWireTest {
         assertFalse(revnixHasCloseAction(conditional))
         val certain = listOf(PaywallBlock.Button("x", "Not now", action = BlockAction.Close))
         assertTrue(revnixHasCloseAction(certain))
+        val close = PaywallBlock.Button("x", "Not now", action = BlockAction.Close)
+        assertFalse(revnixHasCloseAction(listOf(PaywallBlock.Card("c", layout = "carousel", children = listOf(close)))))
+        assertTrue(revnixHasCloseAction(listOf(PaywallBlock.Card("c", layout = "column", children = listOf(close)))))
     }
 }

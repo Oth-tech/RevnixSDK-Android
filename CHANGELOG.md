@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Paywall blocks: `timer` (countdown to a date or from when the paywall opens), `video` (muted looping clip with a poster), `toggle` (free-trial switch that flips the selected package) and the card `carousel` layout (swipeable pages with dots and optional auto-advance).
+
 ## 1.6.0 (2026-10-12)
 
 ### Added

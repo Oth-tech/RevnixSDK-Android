@@ -184,4 +184,26 @@ class PaywallLocalizationTest {
         revnixSetLocaleOverride(null)
         assertNotNull(revnixDeviceLocale())
     }
+
+    @Test
+    fun `timer and toggle strings localize under their own keys`() {
+        val source = """
+            {"version":1,"background":"#000","textColor":"#fff","accent":"#fff","accentInk":"#fff",
+             "defaultLocale":"en",
+             "locales":{"es":{"t.format":"Termina en {mm}:{ss}","t.expiredText":"Expirada","g.label":"Prueba gratis"}},
+             "blocks":[
+               {"id":"t","type":"timer","duration":60,"format":"Ends in {mm}:{ss}","expiredText":"Expired"},
+               {"id":"t2","type":"timer","duration":60},
+               {"id":"g","type":"toggle","label":"Free trial","onPackageIndex":0,"offPackageIndex":1}
+             ]}
+        """
+        val es = doc(source).localized("es")
+        val timer = assertIs<PaywallBlock.Timer>(es.blocks[0])
+        assertEquals("Termina en {mm}:{ss}", timer.format)
+        assertEquals("Expirada", timer.expiredText)
+        val bare = assertIs<PaywallBlock.Timer>(es.blocks[1])
+        assertNull(bare.format)
+        assertNull(bare.expiredText)
+        assertEquals("Prueba gratis", assertIs<PaywallBlock.Toggle>(es.blocks[2]).label)
+    }
 }

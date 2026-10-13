@@ -155,6 +155,11 @@ private fun localizeBlock(block: PaywallBlock, lookup: (String, String) -> Strin
     when (block) {
         is PaywallBlock.Text -> block.copy(text = lookup("${block.id}.text", block.text))
         is PaywallBlock.Button -> block.copy(label = lookup("${block.id}.label", block.label))
+        is PaywallBlock.Toggle -> block.copy(label = lookup("${block.id}.label", block.label))
+        is PaywallBlock.Timer -> block.copy(
+            format = block.format?.let { lookup("${block.id}.format", it) },
+            expiredText = block.expiredText?.let { lookup("${block.id}.expiredText", it) },
+        )
         is PaywallBlock.ListBlock -> block.copy(
             items = block.items.mapIndexed { i, item ->
                 item.copy(
