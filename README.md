@@ -51,7 +51,7 @@ Also public, for less common cases:
 
 ```kotlin
 dependencies {
-    implementation("io.revnix:revnix-android:1.6.0")
+    implementation("io.revnix:revnix-android:1.7.0")
 }
 ```
 
