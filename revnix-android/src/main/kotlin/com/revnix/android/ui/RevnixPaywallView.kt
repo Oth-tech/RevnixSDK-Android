@@ -241,6 +241,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
     /** The packages the active template actually shows ("minimal" filters). */
     private var shownPackages: List<RevnixPaywallPackage> = emptyList()
     private var internalSelected: String? = null
+    private var displayedAt: Long = 0L
+    private val carouselPages = mutableMapOf<String, Int>()
+    private val videoPositions = mutableMapOf<String, Int>()
 
     /** Whether the last render drew a designed (block) paywall. */
     private var blockPaywall: Boolean = false
@@ -352,6 +355,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
         this.onClose = onClose
         this.themeOverride = theme
         this.internalSelected = null
+        this.displayedAt = System.currentTimeMillis()
+        this.carouselPages.clear()
+        this.videoPositions.clear()
         this.selectedPackageId = selectedPackageId
         // A rebind is a new display, so the previous one's beacon must not
         // leak into it and mis-pair the next close (REV-252). Cancelling is
@@ -1598,6 +1604,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     onClose = onClose?.let { { closeAndReport() } },
                     loading = loading,
                     onDiagnostic = diagnosticClient?.let { c -> { m: String -> c.reportRenderDiagnostic(m) } },
+                    displayedAt = displayedAt,
+                    carouselPages = carouselPages,
+                    videoPositions = videoPositions,
                 ),
             ).renderScreen()
         }.getOrNull() ?: return false

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Paywall blocks: `timer` (countdown to a date or from when the paywall opens), `video` (muted looping clip with a poster), `toggle` (free-trial switch that flips the selected package) and the card `carousel` layout (swipeable pages with dots and optional auto-advance).
 - `flushEvents()` sends queued `track` and paywall interaction events now; `preload(placementKeys)` warms the placement cache, and `RevnixClient.preload(context, placementKeys)` in `revnix-android` also downloads the paywalls' images to disk.
 
 ### Changed

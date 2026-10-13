@@ -438,4 +438,84 @@ class PaywallBlocksTest {
         assertEquals(1, assertIs<PaywallBlock.Card>(parsed.blocks[0]).packageIndex)
         assertEquals("packages", assertIs<PaywallBlock.Card>(parsed.blocks[1]).repeat)
     }
+
+    @Test
+    fun `parses timer, video, toggle and a carousel card, and still skips unknown types`() {
+        val parsed = doc(
+            """
+            {$palette,"blocks":[
+              {"id":"t1","type":"timer","duration":600,"format":"Offer ends in {mm}:{ss}","expiredText":"Offer expired"},
+              {"id":"t2","type":"timer","endsAt":"2026-10-31T23:59:59Z"},
+              {"id":"v1","type":"video","url":"https://cdn.example.com/a.mp4","poster":"https://cdn.example.com/a.jpg","fit":"contain"},
+              {"id":"g1","type":"toggle","label":"Free trial enabled","onPackageIndex":0,"offPackageIndex":1},
+              {"id":"c1","type":"card","layout":"carousel","autoAdvance":4,"style":{"height":240},"children":[
+                {"id":"p1","type":"image","url":"https://cdn.example.com/p.jpg","style":{"inset":true}},
+                {"id":"p2","type":"card","children":[]}
+              ]},
+              {"id":"x","type":"hologram"}
+            ]}
+            """,
+        )
+        assertNotNull(parsed)
+        val t1 = assertIs<PaywallBlock.Timer>(parsed.blocks[0])
+        assertEquals(600, t1.duration)
+        assertEquals("Offer ends in {mm}:{ss}", t1.format)
+        assertEquals("Offer expired", t1.expiredText)
+        assertEquals("2026-10-31T23:59:59Z", assertIs<PaywallBlock.Timer>(parsed.blocks[1]).endsAt)
+        val video = assertIs<PaywallBlock.Video>(parsed.blocks[2])
+        assertEquals("https://cdn.example.com/a.mp4", video.url)
+        assertEquals("https://cdn.example.com/a.jpg", video.poster)
+        assertEquals("contain", video.fit)
+        val toggle = assertIs<PaywallBlock.Toggle>(parsed.blocks[3])
+        assertEquals("Free trial enabled", toggle.label)
+        assertEquals(0, toggle.onPackageIndex)
+        assertEquals(1, toggle.offPackageIndex)
+        val carousel = assertIs<PaywallBlock.Card>(parsed.blocks[4])
+        assertEquals("carousel", carousel.layout)
+        assertEquals(4, carousel.autoAdvance)
+        assertEquals(2, carousel.children.size)
+        assertIs<PaywallBlock.Unknown>(parsed.blocks[5])
+    }
+
+    @Test
+    fun `countdown formats the contract examples`() {
+        assertEquals("01:02:05", revnixFormatCountdown(DEFAULT_TIMER_FORMAT, 3725))
+        assertEquals("1d 01:01:01", revnixFormatCountdown("{d}d {hh}:{mm}:{ss}", 90061))
+        assertEquals("25:01", revnixFormatCountdown("{hh}:{mm}", 90061))
+        assertEquals("90:00", revnixFormatCountdown("{mm}:{ss}", 5400))
+        assertEquals("120:00", revnixFormatCountdown("{mm}:{ss}", 7200))
+        assertEquals("125s", revnixFormatCountdown("{ss}s", 125))
+        assertEquals("100:00:00", revnixFormatCountdown(DEFAULT_TIMER_FORMAT, 360000))
+        assertEquals("05 05", revnixFormatCountdown("{ss} {ss}", 5))
+        assertEquals("00:00:00", revnixFormatCountdown(DEFAULT_TIMER_FORMAT, -3))
+    }
+
+    @Test
+    fun `timer counts from display or a fixed deadline, and expires`() {
+        val counting = PaywallBlock.Timer("t", duration = 600, format = "{mm}:{ss}")
+        assertEquals(599, revnixTimerRemaining(counting, 1_000_000, 1_000_500))
+        assertEquals("09:59", revnixTimerText(counting, 599))
+        assertEquals(0, revnixTimerRemaining(counting, 1_000_000, 1_700_000))
+        assertNull(revnixTimerText(counting, 0))
+        assertEquals("Gone", revnixTimerText(counting.copy(expiredText = "Gone"), 0))
+
+        val fixed = PaywallBlock.Timer("t", endsAt = "1970-01-01T00:01:00Z")
+        assertEquals(30, revnixTimerRemaining(fixed, 0, 30_000))
+        assertEquals("00:00:30", revnixTimerText(fixed, 30))
+        assertEquals(0, revnixTimerRemaining(PaywallBlock.Timer("t", endsAt = "next tuesday"), 0, 0))
+
+        val utc = 1_793_491_199_000L
+        assertEquals(1, revnixTimerRemaining(PaywallBlock.Timer("t", endsAt = "2026-10-31T23:59:59Z"), 0, utc - 1_000))
+        val offset = PaywallBlock.Timer("t", endsAt = "2026-10-31T23:59:59.000+05:00")
+        assertEquals(1, revnixTimerRemaining(offset, 0, utc - 5 * 3_600_000L - 1_000))
+    }
+
+    @Test
+    fun `toggle is on with its trial package selected and taps flip between the two indices`() {
+        val toggle = PaywallBlock.Toggle("g", "Free trial", onPackageIndex = 0, offPackageIndex = 1)
+        assertEquals(true to "monthly", revnixToggleState(toggle, packages, "annual"))
+        assertEquals(false to "annual", revnixToggleState(toggle, packages, "monthly"))
+        assertNull(revnixToggleState(toggle.copy(offPackageIndex = 2), packages, "annual"))
+        assertNull(revnixToggleState(toggle.copy(onPackageIndex = -1), packages, "annual"))
+    }
 }

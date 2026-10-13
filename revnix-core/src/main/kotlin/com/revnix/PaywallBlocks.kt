@@ -33,6 +33,9 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.text.ParsePosition
+import java.text.SimpleDateFormat
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -458,10 +461,54 @@ public sealed class PaywallBlock {
         override val visibility: BlockVisibility? = null,
     ) : PaywallBlock()
 
+    /** Countdown text, drawn like [Text]. Exactly one of [endsAt] / [duration] is set. */
+    public data class Timer(
+        override val id: String,
+        /** ISO-8601 instant: one deadline for every viewer. */
+        public val endsAt: String? = null,
+        /** Seconds, counted from when this paywall view was first displayed. */
+        public val duration: Int? = null,
+        /** Tokens `{d}` `{hh}` `{mm}` `{ss}`; defaults to [DEFAULT_TIMER_FORMAT]. */
+        public val format: String? = null,
+        /** Drawn at zero. Absent hides the block at zero. */
+        public val expiredText: String? = null,
+        override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
+    ) : PaywallBlock()
+
+    /** A muted, looping, autoplaying clip, sized like [Image]. [poster] shows until the first frame. */
+    public data class Video(
+        override val id: String,
+        public val url: String,
+        public val poster: String? = null,
+        /** "cover" (default) or "contain". */
+        public val fit: String? = null,
+        override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
+    ) : PaywallBlock()
+
+    /**
+     * The free-trial switch: ON while package [onPackageIndex] is selected;
+     * tapping it selects the other one. Hidden when either index is outside
+     * the offering. See [revnixToggleState].
+     */
+    public data class Toggle(
+        override val id: String,
+        public val label: String,
+        public val onPackageIndex: Int,
+        public val offPackageIndex: Int,
+        override val style: BlockStyle? = null,
+        override val selectedStyle: BlockStyle? = null,
+        override val visibility: BlockVisibility? = null,
+    ) : PaywallBlock()
+
     /**
      * The one container block. `layout` picks how children are placed: column
      * / row are flex lines, `stack` layers them (children position with
-     * style.inset or the edge offsets), and `grid` is an N-column grid.
+     * style.inset or the edge offsets), `grid` is an N-column grid, and
+     * `carousel` shows one child per swipeable page.
      */
     public data class Card(
         override val id: String,
@@ -482,6 +529,8 @@ public sealed class PaywallBlock {
         public val children: List<PaywallBlock> = emptyList(),
         override val style: BlockStyle? = null,
         override val visibility: BlockVisibility? = null,
+        /** carousel only: seconds per page before it moves on by itself. */
+        public val autoAdvance: Int? = null,
     ) : PaywallBlock()
 
     /** A block type this SDK does not know. Skipped when drawing. */
@@ -604,6 +653,15 @@ public data class PaywallBlockDoc(
                 )
                 "line" -> PaywallBlock.Line(id, style, selectedStyle, visibility)
                 "spacer" -> PaywallBlock.Spacer(id, b("flex"), style, selectedStyle, visibility)
+                "timer" -> PaywallBlock.Timer(
+                    id, s("endsAt"), o["duration"]?.intOrNullSafe, s("format"), s("expiredText"),
+                    style, selectedStyle, visibility,
+                )
+                "video" -> PaywallBlock.Video(id, s("url") ?: "", s("poster"), s("fit"), style, selectedStyle, visibility)
+                "toggle" -> PaywallBlock.Toggle(
+                    id, s("label") ?: "", o["onPackageIndex"]?.intOrNullSafe ?: -1,
+                    o["offPackageIndex"]?.intOrNullSafe ?: -1, style, selectedStyle, visibility,
+                )
                 "card" -> PaywallBlock.Card(
                     id = id,
                     layout = s("layout"),
@@ -615,6 +673,7 @@ public data class PaywallBlockDoc(
                     children = (o["children"] as? JsonArray).orEmpty().map { parseBlock(it) },
                     style = style,
                     visibility = visibility,
+                    autoAdvance = o["autoAdvance"]?.intOrNullSafe,
                 )
                 // A block type from a newer dashboard. Skipped when drawing.
                 else -> PaywallBlock.Unknown(id)
@@ -753,6 +812,62 @@ private fun resolveOne(
     }
     // Unknown tag: leave it visible rather than guess.
     else -> raw
+}
+
+public const val DEFAULT_TIMER_FORMAT: String = "{hh}:{mm}:{ss}"
+
+/**
+ * A countdown's text for [remaining] whole seconds. Each token is the
+ * remainder of the next larger unit [format] also shows, so "{mm}:{ss}" with
+ * 90 minutes left reads "90:00".
+ */
+public fun revnixFormatCountdown(format: String, remaining: Long): String {
+    val r = remaining.coerceAtLeast(0)
+    fun pad(n: Long) = n.toString().padStart(2, '0')
+    fun within(vararg units: Pair<String, Long>): Long =
+        units.firstOrNull { it.first in format }?.let { r % it.second } ?: r
+    return format
+        .replace("{d}", (r / 86400).toString())
+        .replace("{hh}", pad(within("{d}" to 86400L) / 3600))
+        .replace("{mm}", pad(within("{hh}" to 3600L, "{d}" to 86400L) / 60))
+        .replace("{ss}", pad(within("{mm}" to 60L, "{hh}" to 3600L, "{d}" to 86400L)))
+}
+
+/** Whole seconds left on [block]. An unparseable `endsAt` counts as expired. */
+public fun revnixTimerRemaining(block: PaywallBlock.Timer, displayedAtMillis: Long, nowMillis: Long): Long {
+    val deadline = when {
+        block.endsAt != null ->
+            parseInstantMillis(block.endsAt) ?: return 0
+        block.duration != null -> displayedAtMillis + block.duration * 1000L
+        else -> return 0
+    }
+    return Math.floorDiv(deadline - nowMillis, 1000L).coerceAtLeast(0)
+}
+
+private fun parseInstantMillis(iso: String): Long? =
+    listOf("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", "yyyy-MM-dd'T'HH:mm:ssXXX").firstNotNullOfOrNull { pattern ->
+        val position = ParsePosition(0)
+        val date = SimpleDateFormat(pattern, Locale.US).apply { isLenient = false }.parse(iso, position)
+        date?.takeIf { position.index == iso.length }?.time
+    }
+
+/** What a timer draws with [remaining] seconds left, or null when it is not drawn. */
+public fun revnixTimerText(block: PaywallBlock.Timer, remaining: Long): String? =
+    if (remaining > 0) revnixFormatCountdown(block.format ?: DEFAULT_TIMER_FORMAT, remaining) else block.expiredText
+
+/**
+ * A toggle's state against the offering: whether it is ON, and the package a
+ * tap selects. Null when the offering reaches either index not at all.
+ */
+public fun revnixToggleState(
+    block: PaywallBlock.Toggle,
+    packages: List<BlockPackage>,
+    selectedPackageId: String?,
+): Pair<Boolean, String>? {
+    val on = packages.getOrNull(block.onPackageIndex) ?: return null
+    val off = packages.getOrNull(block.offPackageIndex) ?: return null
+    val isOn = on.packageId == selectedPackageId
+    return isOn to (if (isOn) off else on).packageId
 }
 
 // ——— colors ———
@@ -969,7 +1084,7 @@ public fun revnixHasCloseAction(blocks: List<PaywallBlock>): Boolean = blocks.an
         // would suppress the fallback and leave the customer with no way out —
         // the exact bug this feature exists to fix.
         is PaywallBlock.Card ->
-            block.repeat == null && block.packageIndex == null &&
+            block.repeat == null && block.packageIndex == null && block.layout != "carousel" &&
                 revnixHasCloseAction(block.children)
         else -> false
     }
