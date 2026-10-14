@@ -309,11 +309,22 @@ public data class BlockStyle(
  * screen instead — worse than the bug this fixes.
  */
 public enum class BlockAction {
-    Close;
+    Close,
+
+    /** Shows the following onboarding screen; on the last one, the paywall. */
+    Next,
+
+    /** Shows the previous onboarding screen. */
+    Back;
 
     internal companion object {
         /** An action this SDK does not know leaves the element inert. */
-        fun from(value: String?): BlockAction? = if (value == "close") Close else null
+        fun from(value: String?): BlockAction? = when (value) {
+            "close" -> Close
+            "next" -> Next
+            "back" -> Back
+            else -> null
+        }
     }
 }
 
@@ -575,6 +586,11 @@ public data class PaywallBlockDoc(
      * is then a no-op and the tree renders exactly as authored.
      */
     public val localization: PaywallLocalization = PaywallLocalization(),
+    /**
+     * Onboarding screens shown in order before [blocks], which is always the
+     * last screen. Empty opens straight on [blocks].
+     */
+    public val screens: List<List<PaywallBlock>> = emptyList(),
 ) {
     public companion object {
         /** The device screen `canvas` designs are authored against. */
@@ -607,6 +623,8 @@ public data class PaywallBlockDoc(
                 accentInk = o["accentInk"]?.stringOrNull ?: "#FFFFFF",
                 fontFamily = o["fontFamily"]?.stringOrNull,
                 blocks = blocks,
+                screens = (o["screens"] as? JsonArray).orEmpty()
+                    .mapNotNull { screen -> (screen as? JsonArray)?.takeIf { it.isNotEmpty() }?.map { parseBlock(it) } },
                 localization = PaywallLocalization.parse(o),
             )
         }

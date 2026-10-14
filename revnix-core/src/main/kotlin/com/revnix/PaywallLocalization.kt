@@ -208,6 +208,7 @@ public fun PaywallBlockDoc.localized(locale: String?): PaywallBlockDoc {
     return copy(
         localization = localization.copy(defaultLocale = chain[0]),
         blocks = blocks.map { localizeBlock(it, lookup) },
+        screens = screens.map { screen -> screen.map { localizeBlock(it, lookup) } },
     )
 }
 

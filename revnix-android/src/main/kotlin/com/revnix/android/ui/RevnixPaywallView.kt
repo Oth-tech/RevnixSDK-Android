@@ -244,6 +244,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private var displayedAt: Long = 0L
     private val carouselPages = mutableMapOf<String, Int>()
     private val videoPositions = mutableMapOf<String, Int>()
+    private var currentScreen = 0
 
     /** Whether the last render drew a designed (block) paywall. */
     private var blockPaywall: Boolean = false
@@ -358,6 +359,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         this.displayedAt = System.currentTimeMillis()
         this.carouselPages.clear()
         this.videoPositions.clear()
+        this.currentScreen = 0
         this.selectedPackageId = selectedPackageId
         // A rebind is a new display, so the previous one's beacon must not
         // leak into it and mis-pair the next close (REV-252). Cancelling is
@@ -1607,6 +1609,11 @@ public class RevnixPaywallView @JvmOverloads constructor(
                     displayedAt = displayedAt,
                     carouselPages = carouselPages,
                     videoPositions = videoPositions,
+                    screen = currentScreen,
+                    onScreen = { index ->
+                        currentScreen = index
+                        render()
+                    },
                 ),
             ).renderScreen()
         }.getOrNull() ?: return false

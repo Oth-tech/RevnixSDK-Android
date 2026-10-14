@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Paywall blocks: onboarding `screens` shown before the paywall, with `next` / `back` actions on text, image and button blocks and progress dots while an onboarding screen is showing.
+
 ## 1.7.0 (2026-10-13)
 
 ### Added

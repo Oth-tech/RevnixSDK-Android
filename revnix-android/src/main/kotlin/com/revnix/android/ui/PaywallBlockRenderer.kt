@@ -143,6 +143,8 @@ internal class BlockContext(
     val carouselPages: MutableMap<String, Int> = mutableMapOf(),
     /** Each video's playback position in ms by block id, kept across selection rebuilds. */
     val videoPositions: MutableMap<String, Int> = mutableMapOf(),
+    val screen: Int = 0,
+    val onScreen: (Int) -> Unit = {},
 )
 
 /**
@@ -156,6 +158,8 @@ internal class PaywallBlockRenderer(
     private val ctx: BlockContext,
 ) {
     private val doc = ctx.doc
+    private val onIntro = ctx.screen < doc.screens.size
+    private val blocks = doc.screens.getOrNull(ctx.screen) ?: doc.blocks
     private val density = context.resources.displayMetrics.density
     private val selectedPackage: BlockPackage? =
         ctx.packages.firstOrNull { it.packageId == ctx.selectedPackageId }
@@ -224,7 +228,7 @@ internal class PaywallBlockRenderer(
             clipChildren = false
         }
         var placed = 0
-        for (block in doc.blocks) {
+        for (block in blocks) {
             val drawn = render(block, BlockSelectionContext.NONE) ?: continue
             body.addView(drawn.view, lineParams(block, drawn.style, placed++, gap = 0, horizontal = false))
         }
@@ -237,9 +241,15 @@ internal class PaywallBlockRenderer(
             clipChildren = false
             clipToPadding = false
         }
+        val dots = progressDots()
         if (doc.layout == "canvas") {
+            val canvas = if (dots == null) body else FrameLayout(context).apply {
+                clipChildren = false
+                addView(body, revnixFillParams())
+                addView(dots)
+            }
             val stage = CanvasStage(
-                context, body,
+                context, canvas,
                 canvasWidth = dp(PaywallBlockDoc.CANVAS_WIDTH.toDouble()),
                 minHeight = dp(PaywallBlockDoc.CANVAS_HEIGHT.toDouble()),
                 maxWidth = dp(CANVAS_MAX_WIDTH),
@@ -260,20 +270,50 @@ internal class PaywallBlockRenderer(
         }
         screen.addView(scroll, revnixFillParams())
 
-        // Added AFTER the scroll, and never inside the scaled body, so the
-        // fallback close keeps its tap size and its distance from the screen
-        // edge whatever the device width does to the design — and sits below
-        // the status bar when the host draws edge to edge.
-        fallbackClose()?.let { chip ->
-            screen.addView(chip)
+        val pinned = listOfNotNull(
+            dots?.takeIf { doc.layout != "canvas" }?.let { it to DOTS_INSET },
+            fallbackClose()?.let { it to CLOSE_INSET },
+        )
+        for ((view, _) in pinned) screen.addView(view)
+        if (pinned.isNotEmpty()) {
             screen.setOnApplyWindowInsetsListener { _, insets ->
-                val params = chip.layoutParams as FrameLayout.LayoutParams
-                params.topMargin = dp(CLOSE_INSET) + statusBarInset(insets)
-                chip.layoutParams = params
+                for ((view, inset) in pinned) {
+                    val params = view.layoutParams as FrameLayout.LayoutParams
+                    params.topMargin = dp(inset) + statusBarInset(insets)
+                    view.layoutParams = params
+                }
                 insets
             }
         }
         return screen
+    }
+
+    private fun progressDots(): View? {
+        if (!onIntro) return null
+        return dotRow(doc.screens.size + 1, ctx.screen).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+            ).apply { topMargin = dp(DOTS_INSET) }
+        }
+    }
+
+    private fun dotRow(count: Int, active: Int): LinearLayout {
+        val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        repeat(count) { index ->
+            row.addView(
+                View(context).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL } },
+                LinearLayout.LayoutParams(dp(6.0), dp(6.0)).apply { if (index > 0) marginStart = dp(6.0) },
+            )
+        }
+        paintDots(row, active)
+        return row
+    }
+
+    private fun paintDots(row: LinearLayout, active: Int) {
+        val accent = revnixBlockColor(doc.accent, doc) ?: Color.WHITE
+        val rest = withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.3)
+        for (i in 0 until row.childCount) (row.getChildAt(i).background as GradientDrawable).setColor(if (i == active) accent else rest)
     }
 
     private fun statusBarInset(insets: WindowInsets): Int =
@@ -299,7 +339,7 @@ internal class PaywallBlockRenderer(
      */
     private fun fallbackClose(): View? {
         val onClose = ctx.onClose ?: return null
-        if (revnixHasCloseAction(doc.blocks)) return null
+        if (revnixHasCloseAction(blocks)) return null
         val ink = revnixBlockColor(doc.textColor, doc) ?: Color.WHITE
         val glyph = TextView(context).apply {
             text = "×"
@@ -335,9 +375,9 @@ internal class PaywallBlockRenderer(
         val view: View = when (block) {
             is PaywallBlock.Text -> textView(
                 revnixResolveTags(block.text, pkg, ctx.packages), style,
-            ).also { closeOnTap(it, block.action) }
+            ).also { actionOnTap(it, block.action) }
 
-            is PaywallBlock.Image -> imageSlot(block, style).also { closeOnTap(it, block.action) }
+            is PaywallBlock.Image -> imageSlot(block, style).also { actionOnTap(it, block.action) }
 
             is PaywallBlock.ListBlock -> listColumn(block, style)
 
@@ -667,19 +707,18 @@ internal class PaywallBlockRenderer(
         return column
     }
 
-    /**
-     * Makes an element the paywall's dismiss target when the design marks it
-     * as one (REV-252). A block with no close action gets no listener at all,
-     * so it never intercepts a tap meant for what sits behind it.
-     */
-    private fun closeOnTap(view: View, action: BlockAction?) {
-        val onClose = ctx.onClose
-        if (action != BlockAction.Close || onClose == null) return
+    private fun actionOnTap(view: View, action: BlockAction?) {
+        val handler = actionHandler(action) ?: return
         view.isClickable = true
-        view.contentDescription = "Close"
-        // The whole box is the target, not just the glyph: a close chip is
-        // mostly padding, and a bare × is well under the 48dp tap minimum.
-        view.setOnClickListener { onClose() }
+        if (action == BlockAction.Close) view.contentDescription = "Close"
+        view.setOnClickListener { handler() }
+    }
+
+    private fun actionHandler(action: BlockAction?): (() -> Unit)? = when (action) {
+        BlockAction.Close -> ctx.onClose
+        BlockAction.Next -> if (onIntro) { { ctx.onScreen(ctx.screen + 1) } } else null
+        BlockAction.Back -> if (onIntro && ctx.screen > 0) { { ctx.onScreen(ctx.screen - 1) } } else null
+        null -> null
     }
 
     /**
@@ -694,8 +733,10 @@ internal class PaywallBlockRenderer(
         // A button the design marks as the close dismisses instead of buying,
         // and takes no accent fill: the CTA must stay the one accented thing
         // on the screen, or a "Not now" competes with "Subscribe" for the eye.
-        val closes = block.action == BlockAction.Close && ctx.onClose != null
-        val busy = ctx.loading && !closes
+        val handler = actionHandler(block.action)
+        val closes = block.action == BlockAction.Close && handler != null
+        val navigates = block.action == BlockAction.Next || block.action == BlockAction.Back
+        val busy = ctx.loading && !closes && !navigates
 
         val label = textView(revnixResolveTags(block.label, pkg, ctx.packages), style)
         // The box half of the style belongs to the button, not its label.
@@ -754,10 +795,11 @@ internal class PaywallBlockRenderer(
             return button
         }
 
+        if (navigates && handler == null) return button
         button.isClickable = true
         button.setOnClickListener {
-            if (closes) {
-                ctx.onClose?.invoke()
+            if (handler != null) {
+                handler()
             } else {
                 val id = ctx.selectedPackageId ?: ctx.packages.firstOrNull()?.packageId
                 if (id != null) ctx.onPurchase(id)
@@ -1013,22 +1055,10 @@ internal class PaywallBlockRenderer(
         box.addView(pager, revnixFillParams())
         val count = pager.strip.childCount
         if (count > 1) {
-            val accent = revnixBlockColor(doc.accent, doc) ?: Color.WHITE
-            val rest = withAlpha(revnixBlockColor(doc.textColor, doc) ?: Color.WHITE, 0.3)
-            val dots = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-            repeat(count) { index ->
-                dots.addView(
-                    View(context).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL } },
-                    LinearLayout.LayoutParams(dp(6.0), dp(6.0)).apply { if (index > 0) marginStart = dp(6.0) },
-                )
-            }
-            fun paint(page: Int) {
-                for (i in 0 until count) (dots.getChildAt(i).background as GradientDrawable).setColor(if (i == page) accent else rest)
-            }
-            paint(pager.current)
+            val dots = dotRow(count, pager.current)
             pager.onPage = { page ->
                 ctx.carouselPages[block.id] = page
-                paint(page)
+                paintDots(dots, page)
             }
             box.addView(
                 dots,
@@ -1330,6 +1360,8 @@ internal class PaywallBlockRenderer(
 
         /** The fallback close chip's distance from the top and trailing edges, in dp. */
         const val CLOSE_INSET = 14.0
+
+        const val DOTS_INSET = 20.0
 
         const val CAROUSEL_HEIGHT = 220.0
     }
