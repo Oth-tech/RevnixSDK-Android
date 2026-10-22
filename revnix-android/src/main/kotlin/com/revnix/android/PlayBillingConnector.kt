@@ -7,6 +7,7 @@ import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClientStateListener
 import com.android.billingclient.api.BillingFlowParams
 import com.android.billingclient.api.BillingResult
+import com.android.billingclient.api.ConsumeParams
 import com.android.billingclient.api.PendingPurchasesParams
 import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
@@ -14,6 +15,7 @@ import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
 import com.android.billingclient.api.QueryPurchasesParams
 import com.android.billingclient.api.acknowledgePurchase
+import com.android.billingclient.api.consumePurchase
 import com.android.billingclient.api.queryProductDetails
 import com.android.billingclient.api.queryPurchasesAsync
 import com.revnix.RegisterPurchaseInput
@@ -41,6 +43,10 @@ import kotlinx.coroutines.withContext
  *    Revnix has the claim would trade a refund window for a lost entitlement.
  *    We acknowledge once [RevnixClient.registerPurchase] has either succeeded
  *    or been durably queued — both mean the claim will reach the server.
+ *    Products in [com.revnix.RevnixConfig.consumableProductIds] are consumed
+ *    instead once the claim is recorded, which also counts as the
+ *    acknowledgement; a queued one is only acknowledged, and the next
+ *    [restore] consumes it.
  * 2. **`transactionId` is the purchaseToken.** Google has no separate
  *    transaction identifier; the token is the stable key the backend dedupes
  *    on.
@@ -84,11 +90,17 @@ public class PlayBillingConnector internal constructor(
                 pending.clear()
             }
             result.responseCode == BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
-                val waiting = pending.values.toList()
+                val waiting = pending.toMap()
                 pending.clear()
                 scope.launch {
                     runCatching { restore() }
-                    waiting.forEach { it.complete(null) }
+                    waiting.forEach { (productId, deferred) ->
+                        if (productId in client.consumableProductIds) {
+                            deferred.completeExceptionally(alreadyOwned(productId))
+                        } else {
+                            deferred.complete(null)
+                        }
+                    }
                 }
             }
             else -> {
@@ -173,7 +185,11 @@ public class PlayBillingConnector internal constructor(
      * Buy [productId]: opens the Play sheet, registers the purchase with
      * Revnix, acknowledges it and returns the registration. Null when the
      * customer cancels, the purchase is pending, or it was already owned (then
-     * it is restored instead). Throws the [RevnixError] registration raised
+     * it is restored instead). An already-owned consumable is restored too, but
+     * throws a retryable [BillingException] with
+     * [BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED]: nothing was
+     * charged, so grant nothing and let the customer try again. Throws the
+     * [RevnixError] registration raised
      * when Play charged but Revnix queued (acknowledged) or refused (not
      * acknowledged) the claim, [ProductNotFoundException] when Play has no such
      * product, and [BillingException] for any other Play failure.
@@ -207,6 +223,7 @@ public class PlayBillingConnector internal constructor(
                 BillingClient.BillingResponseCode.USER_CANCELED -> null
                 BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
                     restore()
+                    if (productId in client.consumableProductIds) throw alreadyOwned(productId)
                     null
                 }
                 else -> throw billingFailure(launched)
@@ -255,7 +272,7 @@ public class PlayBillingConnector internal constructor(
         val outcome = try {
             Registration.Registered(client.registerPurchase(input))
         } catch (err: RevnixError) {
-            if (err.isRetryable) {
+            if (err.queuesPurchase) {
                 diagnostic("registerPurchase", "queued: ${err.message}")
                 Registration.Queued(err)
             } else {
@@ -264,8 +281,22 @@ public class PlayBillingConnector internal constructor(
             }
         }
 
-        if (outcome !is Registration.Refused) acknowledge(purchase)
+        when {
+            outcome is Registration.Registered && input.productId in client.consumableProductIds -> consume(purchase)
+            outcome is Registration.Registered || outcome is Registration.Queued -> acknowledge(purchase)
+        }
         return outcome
+    }
+
+    private suspend fun consume(purchase: Purchase) {
+        val params = ConsumeParams.newBuilder()
+            .setPurchaseToken(purchase.purchaseToken)
+            .build()
+        val result = billing.consumePurchase(params).billingResult
+        if (result.responseCode != BillingClient.BillingResponseCode.OK) {
+            diagnostic("consume", "failed ${result.responseCode}")
+            acknowledge(purchase)
+        }
     }
 
     /** Acknowledge inside Google's 3-day window — never before the claim. */
@@ -287,6 +318,12 @@ public class PlayBillingConnector internal constructor(
         pending.clear()
         scope.cancel()
     }
+
+    private fun alreadyOwned(productId: String) = BillingException(
+        BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED,
+        "\"$productId\" was already owned and has been restored; try again",
+        isRetryable = true,
+    )
 
     private fun billingFailure(result: BillingResult) = BillingException(
         result.responseCode,

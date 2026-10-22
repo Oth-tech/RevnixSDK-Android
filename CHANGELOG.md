@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- `RevnixConfig.consumableProductIds`: Play purchases of these products are consumed after Revnix records them, so they can be bought again. If the server is unreachable the purchase is acknowledged and queued, and consumed on a later restore. Purchases acknowledged by older versions are consumed on the next restore once listed. If consume fails, the SDK acknowledges instead and reports a diagnostic.
+- Buying a listed consumable that is still owned throws `BillingException` with `ITEM_ALREADY_OWNED` (retryable) after restoring it.
+
+### Changed
+
+- A server 401 or 404 (endpoint not found, e.g. wrong baseUrl) on a purchase is now handled like a network failure: acknowledged, queued and retried, so Google does not refund a real purchase over a developer config mistake. 403, 409 and other 4xx stay unacknowledged.
+- Queued purchases are retried as the customer who bought them, even after logout.
+- `handleDeepLink` reports only scheme, host, path and known attribution query params (utm_*, campaign_id, pid, gclid, gbraid, wbraid, ttclid, sccid, twclid, revnix_link, web_id and similar). Other query params, the fragment and credentials are dropped before upload. `resolveDeepLink` still sends the full URL.
+
+### Fixed
+
+- Minting the anonymous customer id is thread-safe; a logout during an in-flight purchase is no longer overwritten.
+
 ## 1.8.0 (2026-10-14)
 
 ### Added

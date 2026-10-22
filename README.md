@@ -87,6 +87,8 @@ billing.launchPurchase(activity, productDetails)
 appScope.launch { if (client.isEntitled("pro")) { /* … */ } }
 ```
 
+Consumable products: list their ids in `RevnixConfig.consumableProductIds` (a `Set<String>`) and the connector consumes them after Revnix records the purchase, so they can be bought again.
+
 Use the **publishable** key (`rvx_pk_…`) only. Secret keys must never ship in a
 binary, so `identify`/`alias` are deliberately not SDK methods; proxy them from
 your server (see the docs recipe).

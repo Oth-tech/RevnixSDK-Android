@@ -2,9 +2,11 @@ package com.revnix
 
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.net.URLDecoder
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.Collections
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
@@ -62,6 +64,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
  */
 public class RevnixClient(private val config: RevnixConfig) {
 
+    /** [RevnixConfig.consumableProductIds], for the Play connector. */
+    public val consumableProductIds: Set<String> get() = config.consumableProductIds
+
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = false
@@ -79,6 +84,8 @@ public class RevnixClient(private val config: RevnixConfig) {
     private var bgFailures = 0
 
     private val deferredDeepLinkLock = Any()
+    private val identityLock = Any()
+    private val queueLock = Any()
 
     private val eventQueueLock = Any()
     private val eventFlushMutex = Mutex()
@@ -220,21 +227,21 @@ public class RevnixClient(private val config: RevnixConfig) {
     // MARK: - Identity
 
     /** Anonymous id, minted and persisted on first call. */
-    public fun customerId(): String {
+    public fun customerId(): String = synchronized(identityLock) {
         config.storage.get(KEY_CUSTOMER_ID)?.let { return it }
         val minted = generateAnonymousId()
         config.storage.set(KEY_CUSTOMER_ID, minted)
         // REV-272: the install signal. [logout] below deliberately does not set
         // it — a new anonymous session is not a new install.
         mintedThisLaunch = true
-        return minted
+        minted
     }
 
     /** Fresh anonymous identity. Per-customer caches age out via LRU. */
-    public fun logout(): String {
+    public fun logout(): String = synchronized(identityLock) {
         val minted = generateAnonymousId()
         config.storage.set(KEY_CUSTOMER_ID, minted)
-        return minted
+        minted
     }
 
     /** Release the internal coroutine scope. */
@@ -393,16 +400,20 @@ public class RevnixClient(private val config: RevnixConfig) {
         val cid = customerId()
         try {
             val result = postPurchase(input, cid)
-            if (result.customerId != cid) {
-                // Identity resolution merged us — adopt the canonical id.
-                config.storage.set(KEY_CUSTOMER_ID, result.customerId)
-            }
+            adoptMergedId(cid, result.customerId)
             removeQueued(queueKey(input))
             invalidatePlacements()
             return result
         } catch (err: RevnixError) {
-            if (err.isRetryable) enqueue(input)
+            if (err.queuesPurchase) enqueue(input, cid)
             throw err
+        }
+    }
+
+    private fun adoptMergedId(postedAs: String, canonical: String) {
+        if (canonical == postedAs) return
+        synchronized(identityLock) {
+            if (config.storage.get(KEY_CUSTOMER_ID) == postedAs) config.storage.set(KEY_CUSTOMER_ID, canonical)
         }
     }
 
@@ -421,13 +432,13 @@ public class RevnixClient(private val config: RevnixConfig) {
                 continue
             }
             try {
-                postPurchase(item.toInput(), cid)
+                val buyer = item.customerId ?: cid
+                adoptMergedId(buyer, postPurchase(item.toInput(), buyer).customerId)
                 removeQueued(item.key)
                 invalidatePlacements()
                 delivered += 1
             } catch (err: RevnixError) {
-                if (!err.isRetryable) {
-                    // The server refused on purpose — retrying forever is noise.
+                if (!err.queuesPurchase) {
                     removeQueued(item.key)
                     diagnostic("retryPendingPurchases", "dropped ${item.key}: ${err.message}")
                 } else {
@@ -1182,7 +1193,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         val present = launchBatch?.let { !it.await() } ?: true
         fireImplicit(
             RevnixImplicitPlacement.DEEPLINK_OPEN,
-            buildJsonObject { put("url", JsonPrimitive(url.take(1024))) },
+            buildJsonObject { put("url", JsonPrimitive(redactDeepLink(url).take(1024))) },
             present = present,
         )
     }
@@ -1551,6 +1562,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         val signedTransactionInfo: String? = null,
         val rawPayload: JsonElement? = null,
         val queuedAt: Long? = null,
+        val customerId: String? = null,
     ) {
         fun toInput(): RegisterPurchaseInput = RegisterPurchaseInput(
             source = RevnixStore.fromWire(source),
@@ -1630,40 +1642,43 @@ public class RevnixClient(private val config: RevnixConfig) {
         }.getOrElse { emptyList() }
     }
 
-    private fun stampedQueuedItems(now: Long): List<QueuedPurchase> {
+    private fun stampedQueuedItems(now: Long): List<QueuedPurchase> = synchronized(queueLock) {
         val items = queuedItems()
         if (items.none { it.queuedAt == null }) return items
-        return items.map { it.copy(queuedAt = it.queuedAt ?: now) }.also { persistQueue(it) }
+        items.map { it.copy(queuedAt = it.queuedAt ?: now) }.also { persistQueue(it) }
     }
 
     private fun persistQueue(items: List<QueuedPurchase>) {
         config.storage.set(KEY_QUEUE, json.encodeToString(queueSerializer, items))
     }
 
-    private fun enqueue(input: RegisterPurchaseInput) {
-        val items = queuedItems()
+    private fun enqueue(input: RegisterPurchaseInput, customerId: String) {
         val key = queueKey(input)
-        if (items.any { it.key == key }) return
-        val overflow = items.size - PURCHASE_QUEUE_CAP + 1
-        if (overflow > 0) diagnostic("purchaseQueue", "dropped $overflow oldest")
-        persistQueue(
-            items.drop(overflow.coerceAtLeast(0)) + QueuedPurchase(
-                key = key,
-                source = input.source.wire,
-                token = input.token,
-                productId = input.productId,
-                transactionId = input.transactionId,
-                occurredAt = input.occurredAt,
-                expiresAt = input.expiresAt,
-                signedTransactionInfo = input.signedTransactionInfo,
-                rawPayload = input.rawPayload,
-                queuedAt = config.now(),
-            )
+        val queued = QueuedPurchase(
+            key = key,
+            source = input.source.wire,
+            token = input.token,
+            productId = input.productId,
+            transactionId = input.transactionId,
+            occurredAt = input.occurredAt,
+            expiresAt = input.expiresAt,
+            signedTransactionInfo = input.signedTransactionInfo,
+            rawPayload = input.rawPayload,
+            queuedAt = config.now(),
+            customerId = customerId,
         )
+        val overflow = synchronized(queueLock) {
+            val items = queuedItems()
+            if (items.any { it.key == key }) return
+            val overflow = items.size - PURCHASE_QUEUE_CAP + 1
+            persistQueue(items.drop(overflow.coerceAtLeast(0)) + queued)
+            overflow
+        }
+        if (overflow > 0) diagnostic("purchaseQueue", "dropped $overflow oldest")
     }
 
     private fun removeQueued(key: String) {
-        persistQueue(queuedItems().filterNot { it.key == key })
+        synchronized(queueLock) { persistQueue(queuedItems().filterNot { it.key == key }) }
     }
 
     private fun queuedEvents(): List<QueuedEvent> {
@@ -1732,4 +1747,24 @@ public class RevnixClient(private val config: RevnixConfig) {
     private fun diagnostic(op: String, message: String) {
         config.onDiagnostic?.invoke(RevnixDiagnostic(op, message))
     }
+}
+
+private val DEEP_LINK_REPORTED_PARAMS = setOf(
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "pid", "source", "af_channel", "medium", "c", "campaign", "term", "af_ad", "content",
+    "utm_id", "campaign_id",
+    "gclid", "gbraid", "wbraid", "ttclid", "sccid", "twclid", "revnix_link", "web_id",
+)
+
+private val DEEP_LINK_USERINFO = Regex("^([A-Za-z][A-Za-z0-9+.-]*://)[^/\\\\]*@")
+
+internal fun redactDeepLink(url: String): String {
+    val beforeFragment = url.substringBefore('#')
+    val base = beforeFragment.substringBefore('?').replaceFirst(DEEP_LINK_USERINFO, "$1")
+    val kept = beforeFragment.substringAfter('?', "").split('&').filter {
+        val name = it.substringBefore('=')
+        val decoded = runCatching { URLDecoder.decode(name, "UTF-8") }.getOrDefault(name)
+        decoded.lowercase(Locale.ROOT) in DEEP_LINK_REPORTED_PARAMS
+    }
+    return if (kept.isEmpty()) base else "$base?${kept.joinToString("&")}"
 }
