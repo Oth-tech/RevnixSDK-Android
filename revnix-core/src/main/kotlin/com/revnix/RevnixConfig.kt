@@ -131,6 +131,13 @@ public data class RevnixConfig(
      * previously stored `gps_adid`; a throw or a 10 s timeout changes nothing.
      */
     val advertisingId: (suspend () -> String?)? = null,
+    /**
+     * Play product ids that are consumables. The Play connector consumes these
+     * instead of acknowledging them once the server recorded the claim, so the
+     * customer can buy them again. A claim that was only queued is
+     * acknowledged, and consumed on a later restore that registers it.
+     */
+    val consumableProductIds: Set<String> = emptySet(),
 ) {
     /**
      * REV-272: the rule the client reads — [implicitPlacements] when set, else

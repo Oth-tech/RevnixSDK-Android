@@ -410,6 +410,68 @@ class RevnixClientTest {
         assertEquals(0, client.pendingPurchaseCount())
     }
 
+    @Test
+    fun `a 404 purchase is queued and kept by the drain while it still 404s`() = runBlocking {
+        route("/purchases" to { json(404, """{"error":"unknown product"}""") })
+        val client = makeClient()
+
+        assertFailsWith<RevnixError.NotFound> { client.registerPurchase(purchase) }
+        assertEquals(1, client.pendingPurchaseCount())
+        assertEquals(0, client.retryPendingPurchases())
+        assertEquals(1, client.pendingPurchaseCount())
+
+        route("/purchases" to { json(201, purchaseBody) })
+        assertEquals(1, client.retryPendingPurchases())
+        assertEquals(0, client.pendingPurchaseCount())
+    }
+
+    @Test
+    fun `a logout during a merging registerPurchase keeps the new anonymous id`() = runBlocking {
+        val client = makeClient()
+        var loggedOut: String? = null
+        route("/purchases" to {
+            loggedOut = client.logout()
+            json(201, purchaseBody)
+        })
+        client.customerId()
+
+        client.registerPurchase(purchase)
+
+        assertEquals(loggedOut, client.customerId())
+    }
+
+    @Test
+    fun `a queued purchase drains as its buyer after a logout`() = runBlocking {
+        route("/purchases" to { disconnect() })
+        val client = makeClient()
+        val buyer = client.customerId()
+        assertFailsWith<RevnixError.Network> { client.registerPurchase(purchase) }
+        val afterLogout = client.logout()
+        while (server.takeRequest(100, java.util.concurrent.TimeUnit.MILLISECONDS) != null) Unit
+
+        route("/purchases" to { json(201, purchaseBody) })
+        assertEquals(1, client.retryPendingPurchases())
+
+        val sent = kotlinx.serialization.json.Json.parseToJsonElement(
+            server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8(),
+        ).jsonObject
+        assertEquals(buyer, sent["customerId"]!!.jsonPrimitive.content)
+        assertEquals(afterLogout, client.customerId())
+    }
+
+    @Test
+    fun `concurrent first customerId calls mint one id`() {
+        repeat(20) {
+            val client = makeClient()
+            val start = java.util.concurrent.CountDownLatch(1)
+            val ids = Collections.synchronizedSet(mutableSetOf<String>())
+            val threads = List(16) { Thread { start.await(); ids += client.customerId() }.apply { start() } }
+            start.countDown()
+            threads.forEach { it.join() }
+            assertEquals(setOf(client.customerId()), ids)
+        }
+    }
+
     // MARK: - Cache fallback discipline (spec: "REV-198")
 
     @Test
@@ -1446,6 +1508,47 @@ class RevnixClientTest {
         assertEquals(
             LastDeepLink("https://example.com/promo?utm_source=ig", 1_000L),
             client.getLastDeepLink(),
+        )
+    }
+
+    @Test
+    fun `handleDeepLink reports only allowlisted params while storing the full url`() = runBlocking {
+        route("placements/triggered" to { json(200, paywallLegacyBody) })
+        val client = makeClient()
+        val url = "https://user:pw@example.com:8443/promo?email=a%40b.c&UTM_Source=ig&token=s3cret&gclid=g1#frag"
+
+        client.handleDeepLink(url)
+
+        val sent = kotlinx.serialization.json.Json.parseToJsonElement(
+            server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8(),
+        ).jsonObject
+        assertEquals("https://example.com:8443/promo?UTM_Source=ig&gclid=g1", sent["url"]!!.jsonPrimitive.content)
+        assertEquals(url, client.getLastDeepLink()?.url)
+    }
+
+    @Test
+    fun `redactDeepLink keeps scheme, host, path and allowlisted params only`() {
+        assertEquals("myapp://promo/summer?campaign=s&c=x", redactDeepLink("myapp://promo/summer?campaign=s&uid=42&c=x"))
+        assertEquals("myapp://promo", redactDeepLink("myapp://promo?uid=42#section"))
+        assertEquals("myapp://promo?Web_Id=w&wbraid", redactDeepLink("myapp://promo?Web_Id=w&wbraid&pidx=1"))
+        assertEquals("myapp://promo bad?utm_source=x", redactDeepLink("myapp://promo bad?utm_source=x#y"))
+        assertEquals(
+            "https://x.io/p?utm_campaign={{campaign.name}}",
+            redactDeepLink("https://x.io/p?utm_campaign={{campaign.name}}&promo=50%_off&bad=%zz&pipe=a|b"),
+        )
+        assertEquals("https://x.io/p?utm%5Fsource=a", redactDeepLink("https://x.io/p?utm%5Fsource=a&uid=1"))
+        assertEquals("myapp:promo?utm_source=a", redactDeepLink("myapp:promo?utm_source=a&t=1"))
+        assertEquals("https://x.io\\p?gclid=g", redactDeepLink("https://u:p@x.io\\p?gclid=g"))
+        assertEquals("not a url", redactDeepLink("not a url#frag"))
+        assertEquals("mailto:a@b.c", redactDeepLink("mailto:a@b.c?subject=hi"))
+        assertEquals("https://x.io/a@b", redactDeepLink("https://x.io/a@b?email=a@b.c"))
+        assertEquals(
+            "https://x.io/p?utm_id=u1&Campaign_ID=c9",
+            redactDeepLink("https://x.io/p?utm_id=u1&uid=7&Campaign_ID=c9"),
+        )
+        assertEquals(
+            "https://x.io/p?utm_campaign=a%2Bb&utm_term=c+d%20e",
+            redactDeepLink("https://x.io/p?utm_campaign=a%2Bb&q=%26&utm_term=c+d%20e"),
         )
     }
 

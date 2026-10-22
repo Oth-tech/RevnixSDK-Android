@@ -34,11 +34,13 @@ import com.revnix.MemoryStorage
 import com.revnix.RegisterPurchaseResult
 import com.revnix.RevnixClient
 import com.revnix.RevnixConfig
+import com.revnix.RevnixError
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
@@ -59,6 +61,9 @@ class PlayBillingConnectorTest {
     private lateinit var client: RevnixClient
     private lateinit var listener: PurchasesUpdatedListener
     private val acknowledged = mutableListOf<String>()
+    private val consumed = mutableListOf<String>()
+    private var owned = emptyList<Purchase>()
+    private var consumeCode = BillingClient.BillingResponseCode.OK
 
     @BeforeTest
     fun setUp() {
@@ -66,7 +71,12 @@ class PlayBillingConnectorTest {
         server = MockWebServer()
         server.start()
         client = RevnixClient(
-            RevnixConfig(apiKey = "rvx_pk_test_abc", baseUrl = server.url("/").toString(), storage = MemoryStorage())
+            RevnixConfig(
+                apiKey = "rvx_pk_test_abc",
+                baseUrl = server.url("/").toString(),
+                storage = MemoryStorage(),
+                consumableProductIds = setOf("coins"),
+            )
         )
     }
 
@@ -77,10 +87,21 @@ class PlayBillingConnectorTest {
         Dispatchers.resetMain()
     }
 
-    private fun waitingPurchase(): CompletableDeferred<RegisterPurchaseResult?> {
-        val connector = PlayBillingConnector(client, null) { listener = it; FakeBilling() }
-        return CompletableDeferred<RegisterPurchaseResult?>().also { connector.pending["pro"] = it }
-    }
+    private fun connector() = PlayBillingConnector(client, null) { listener = it; FakeBilling() }
+
+    private fun waitingPurchase(productId: String = "pro"): CompletableDeferred<RegisterPurchaseResult?> =
+        CompletableDeferred<RegisterPurchaseResult?>().also { connector().pending[productId] = it }
+
+    private fun purchase(productId: String, token: String, acknowledged: Boolean = false) = Purchase(
+        """{"productId":"$productId","purchaseToken":"$token","purchaseTime":1,"acknowledged":$acknowledged}""",
+        "",
+    )
+
+    private fun registered() = MockResponse().setResponseCode(201)
+        .setBody("""{"eventId":"evt_1","seq":9,"duplicate":false,"customerId":"cust_1"}""")
+
+    private fun refused(status: Int, error: String) =
+        MockResponse().setResponseCode(status).setBody("""{"error":"$error"}""")
 
     private fun billingResult(code: Int) = BillingResult.newBuilder().setResponseCode(code).build()
 
@@ -121,7 +142,153 @@ class PlayBillingConnectorTest {
         assertTrue(err.isRetryable)
     }
 
+    @Test
+    fun `a consumable is consumed, not acknowledged`() {
+        server.enqueue(registered())
+        val deferred = waitingPurchase("coins")
+
+        listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.OK), listOf(purchase("coins", "tok_c")))
+
+        assertEquals(9, await(deferred)?.seq)
+        assertEquals(listOf("tok_c"), consumed)
+        assertTrue(acknowledged.isEmpty())
+    }
+
+    @Test
+    fun `a queued consumable is acknowledged, not consumed, and a later successful restore consumes it`() {
+        server.enqueue(refused(503, "down"))
+        val deferred = waitingPurchase("coins")
+
+        listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.OK), listOf(purchase("coins", "tok_q")))
+
+        assertTrue(assertFailsWith<RevnixError> { await(deferred) }.queuesPurchase)
+        assertEquals(listOf("tok_q"), acknowledged)
+        assertTrue(consumed.isEmpty())
+
+        server.enqueue(registered())
+        owned = listOf(purchase("coins", "tok_q", acknowledged = true))
+        assertEquals(1, runBlocking { connector().restore() })
+        assertEquals(listOf("tok_q"), consumed)
+    }
+
+    @Test
+    fun `an already-owned consumable is restored and consumed, then fails as retryable instead of succeeding`() {
+        server.enqueue(registered())
+        owned = listOf(purchase("coins", "tok_stuck", acknowledged = true))
+        val deferred = waitingPurchase("coins")
+
+        listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED), null)
+
+        val err = assertFailsWith<BillingException> { await(deferred) }
+        assertEquals(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED, err.responseCode)
+        assertTrue(err.isRetryable)
+        assertEquals(listOf("tok_stuck"), consumed)
+    }
+
+    @Test
+    fun `an already-owned non-consumable still resolves null after restore`() {
+        server.enqueue(registered())
+        owned = listOf(purchase("pro", "tok_owned", acknowledged = true))
+        val deferred = waitingPurchase("pro")
+
+        listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED), null)
+
+        assertNull(await(deferred))
+        assertTrue(consumed.isEmpty())
+    }
+
+    @Test
+    fun `a failed consume falls back to acknowledge`() {
+        consumeCode = BillingClient.BillingResponseCode.ERROR
+        server.enqueue(registered())
+        val deferred = waitingPurchase("coins")
+
+        listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.OK), listOf(purchase("coins", "tok_sub_listed")))
+
+        assertEquals(9, await(deferred)?.seq)
+        assertEquals(listOf("tok_sub_listed"), consumed)
+        assertEquals(listOf("tok_sub_listed"), acknowledged)
+    }
+
+    @Test
+    fun `only the registered first product decides whether a purchase is consumed`() {
+        server.enqueue(registered())
+        owned = listOf(
+            Purchase("""{"productIds":["pro","coins"],"purchaseToken":"tok_multi","purchaseTime":1,"acknowledged":false}""", ""),
+        )
+
+        runBlocking { connector().restore() }
+
+        assertTrue(server.takeRequest().body.readUtf8().contains("\"productId\":\"pro\""))
+        assertEquals(listOf("tok_multi"), acknowledged)
+        assertTrue(consumed.isEmpty())
+    }
+
+    @Test
+    fun `restore consumes an already acknowledged consumable and skips an acknowledged subscription`() {
+        server.enqueue(registered())
+        server.enqueue(registered())
+        owned = listOf(purchase("coins", "tok_stuck", acknowledged = true), purchase("pro", "tok_sub", acknowledged = true))
+
+        assertEquals(2, runBlocking { connector().restore() })
+
+        assertEquals(listOf("tok_stuck"), consumed)
+        assertTrue(acknowledged.isEmpty())
+    }
+
+    @Test
+    fun `restore does not consume a consumable the server blocked`() {
+        server.enqueue(refused(409, "purchase blocked"))
+        owned = listOf(purchase("coins", "tok_blocked", acknowledged = true))
+
+        assertEquals(0, runBlocking { connector().restore() })
+
+        assertTrue(consumed.isEmpty())
+    }
+
+    @Test
+    fun `401 and 404 acknowledge and queue the purchase`() {
+        for ((status, token) in listOf(401 to "tok_401", 404 to "tok_404")) {
+            server.enqueue(refused(status, "nope"))
+            val deferred = waitingPurchase()
+
+            listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.OK), listOf(purchase("pro", token)))
+
+            val err = assertFailsWith<RevnixError> { await(deferred) }
+            assertTrue(err.queuesPurchase)
+        }
+        assertEquals(listOf("tok_401", "tok_404"), acknowledged)
+        assertEquals(2, client.pendingPurchaseCount())
+    }
+
+    @Test
+    fun `a 409 purchase block and a 403 proof rejection are neither acknowledged nor queued`() {
+        for ((status, token) in listOf(409 to "tok_409", 403 to "tok_403")) {
+            server.enqueue(refused(status, "purchase blocked"))
+            val deferred = waitingPurchase()
+
+            listener.onPurchasesUpdated(billingResult(BillingClient.BillingResponseCode.OK), listOf(purchase("pro", token)))
+
+            val err = assertFailsWith<RevnixError> { await(deferred) }
+            assertFalse(err.queuesPurchase)
+        }
+        assertTrue(acknowledged.isEmpty())
+        assertEquals(0, client.pendingPurchaseCount())
+    }
+
     private inner class FakeBilling : BillingClient() {
+        private var purchaseQueries = 0
+
+        override fun consumeAsync(params: ConsumeParams, listener: ConsumeResponseListener) {
+            consumed += params.purchaseToken
+            listener.onConsumeResponse(billingResult(consumeCode), params.purchaseToken)
+        }
+
+        override fun queryPurchasesAsync(params: QueryPurchasesParams, listener: PurchasesResponseListener) {
+            val inapp = purchaseQueries++ == 1
+            listener.onQueryPurchasesResponse(billingResult(BillingResponseCode.OK), if (inapp) owned else emptyList())
+        }
+
         override fun acknowledgePurchase(params: AcknowledgePurchaseParams, listener: AcknowledgePurchaseResponseListener) {
             acknowledged += params.purchaseToken
             listener.onAcknowledgePurchaseResponse(billingResult(BillingResponseCode.OK))
@@ -140,7 +307,6 @@ class PlayBillingConnectorTest {
         override fun showInAppMessages(
             activity: Activity, params: InAppMessageParams, listener: InAppMessageResponseListener,
         ): BillingResult = unused()
-        override fun consumeAsync(params: ConsumeParams, listener: ConsumeResponseListener) = unused()
         override fun createAlternativeBillingOnlyReportingDetailsAsync(
             listener: AlternativeBillingOnlyReportingDetailsListener,
         ) = unused()
@@ -157,7 +323,6 @@ class PlayBillingConnectorTest {
             activity: Activity, params: LaunchExternalLinkParams, listener: LaunchExternalLinkResponseListener,
         ) = unused()
         override fun queryProductDetailsAsync(params: QueryProductDetailsParams, listener: ProductDetailsResponseListener) = unused()
-        override fun queryPurchasesAsync(params: QueryPurchasesParams, listener: PurchasesResponseListener) = unused()
         override fun startConnection(listener: BillingClientStateListener) = unused()
 
         private fun unused(): Nothing = error("not used by these tests")

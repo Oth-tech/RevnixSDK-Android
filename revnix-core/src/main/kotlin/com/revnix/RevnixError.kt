@@ -57,6 +57,15 @@ public sealed class RevnixError(
     public class Invalid(public val status: Int, detail: String) :
         RevnixError(detail.ifEmpty { "request rejected ($status)" }, isRetryable = false)
 
+    /**
+     * True when a purchase registration that failed this way is queued for
+     * retry, so the store purchase can be acknowledged: every retryable error,
+     * plus 401 and 404 (endpoint not found, e.g. wrong baseUrl), which a key or base URL fix can still resolve. A 403 on a
+     * purchase means its proof was rejected, so it is not queued.
+     */
+    public val queuesPurchase: Boolean
+        get() = isRetryable || (this is Auth && status == 401) || this is NotFound
+
     public companion object {
         public fun fromHttp(status: Int, message: String, retryAfter: String? = null): RevnixError =
             when (status) {
