@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.9.0 (2026-10-22)
+
 ### Added
 
 - `RevnixClient.flags()`: the feature flags set in Settings → Flags in the dashboard, read once per launch from the same `/v1/config` request as implicit placements. Empty when none are set or the request fails.
@@ -27,12 +29,15 @@
 - Paywall blocks: onboarding `screens` shown before the paywall, with `next` / `back` actions on text, image and button blocks and progress dots while an onboarding screen is showing.
 
 ## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
 
 ### Added
 
 - `advertisingId = googleAdvertisingId(context)` stores the Google Advertising ID on the customer as `gps_adid` after `registerInstall`, resent only when it changes and deleted after an opt-out; needs `com.google.android.gms:play-services-ads-identifier` and the `com.google.android.gms.permission.AD_ID` permission in the app; without them, or after an opt-out, nothing is stored.
 - Paywall blocks: `timer` (countdown to a date or from when the paywall opens), `video` (muted looping clip with a poster), `toggle` (free-trial switch that flips the selected package) and the card `carousel` layout (swipeable pages with dots and optional auto-advance).
 
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
 
@@ -49,6 +54,10 @@
 - `AndroidStorage` and `FileStorage` no longer read from disk in their constructors.
 - The purchase retry queue holds at most 100 purchases and drops ones older than 30 days.
 
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
