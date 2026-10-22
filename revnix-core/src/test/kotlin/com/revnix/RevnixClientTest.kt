@@ -19,6 +19,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.double
+import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -226,6 +229,34 @@ class RevnixClientTest {
         val client = makeClient()
         val err = assertFailsWith<RevnixError.Network> { client.resolvePlacement("main") }
         assertTrue(err.isRetryable)
+    }
+
+    @Test
+    fun `flags returns the dashboard map and fetches config once`() = runBlocking {
+        val calls = AtomicInteger(0)
+        route("/v1/config" to {
+            calls.incrementAndGet()
+            json(200, """{"revision":1,"implicitPlacements":[],"flags":{"a":"x","b":3,"c":true}}""")
+        })
+        val client = makeClient()
+        val flags = client.flags()
+        assertEquals("x", flags["a"]?.content)
+        assertEquals(3, flags["b"]?.int)
+        assertEquals(true, flags["c"]?.jsonPrimitive?.content?.toBoolean())
+        client.flags()
+        assertEquals(1, calls.get())
+    }
+
+    @Test
+    fun `flags is empty when the server sends none`() = runBlocking {
+        route("/v1/config" to { json(200, """{"revision":1,"implicitPlacements":[]}""") })
+        assertTrue(makeClient().flags().isEmpty())
+    }
+
+    @Test
+    fun `flags is empty and does not throw on a 500`() = runBlocking {
+        route("/v1/config" to { json(500, """{"error":"boom"}""") })
+        assertTrue(makeClient().flags().isEmpty())
     }
 
     // MARK: - Entitlement cache (spec: "C7 entitlement cache")
@@ -1641,6 +1672,59 @@ class RevnixClientTest {
         client.logPaywallEvent(RevnixPaywallEvent.Restore, viewId, placementKey = REVNIX_PREVIEW_PLACEMENT_KEY)
         client.flushEvents()
         assertNull(server.takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun `identify adopts the id, ignores blank, and logout mints a fresh anonymous id`() {
+        val client = makeClient()
+        val anon = client.customerId()
+        assertEquals("user_1", client.identify("  user_1 "))
+        assertEquals("user_1", client.customerId())
+        assertEquals("user_1", client.identify("   "))
+        assertEquals("user_1", client.identify("x".repeat(201)))
+        val after = client.logout()
+        assertTrue(after != "user_1" && after != anon)
+    }
+
+    @Test
+    fun `identify before the first customerId still reports app_install`() = runBlocking {
+        route(
+            "v1/config" to { json(200, """{"implicitPlacements":["app_install"]}""") },
+            "placements/triggered" to { json(200, paywallLegacyBody) },
+        )
+        val client = makeClient(onImplicitPaywall = {})
+        client.identify("u")
+
+        val requests = generateSequence { server.takeRequest(1500, java.util.concurrent.TimeUnit.MILLISECONDS) }.toList()
+        assertTrue(requests.any { it.path.orEmpty().contains("placements/triggered") && it.body.readUtf8().contains("app_install") })
+    }
+
+    @Test
+    fun `PlacementResolution decodes decisionId when present and null when absent`() {
+        val j = Json { ignoreUnknownKeys = true }
+        val base = """"status":"ok","placementKey":"p","revision":1,"offering":{"offeringId":"o","displayName":"O"}"""
+        val with = j.decodeFromString(PlacementResolution.serializer(), "{$base,\"decisionId\":\"d1\"}")
+        val without = j.decodeFromString(PlacementResolution.serializer(), "{$base}")
+        assertEquals("d1", with.decisionId)
+        assertNull(without.decisionId)
+    }
+
+    @Test
+    fun `paywall reports carry the decision fields only when given`() = runBlocking {
+        route("/paywalls/viewed" to { json(200, "{}") }, "/paywalls/closed" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.logPaywallDisplay("p", "pw", decisionId = "d1", priceShown = 4.99, screenIndex = 2, blockId = "b", durationMs = 7)
+        val full = Json.parseToJsonElement(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8()).jsonObject
+        assertEquals("d1", full["decisionId"]!!.jsonPrimitive.content)
+        assertEquals(4.99, full["priceShown"]!!.jsonPrimitive.double)
+        assertEquals(2, full["screenIndex"]!!.jsonPrimitive.int)
+        assertEquals("b", full["blockId"]!!.jsonPrimitive.content)
+        assertEquals(7L, full["durationMs"]!!.jsonPrimitive.long)
+
+        client.logPaywallClosed("v1", "p", "pw")
+        val bare = Json.parseToJsonElement(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8()).jsonObject
+        listOf("decisionId", "priceShown", "screenIndex", "blockId", "durationMs").forEach { assertFalse(it in bare) }
     }
 
     @Test

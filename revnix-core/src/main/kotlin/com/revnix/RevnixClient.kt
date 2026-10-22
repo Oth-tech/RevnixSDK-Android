@@ -118,7 +118,7 @@ public class RevnixClient(private val config: RevnixConfig) {
      * [implicitConfigRetryAt] keeps that retry from happening on every paywall
      * close of an offline session: one probe per minute.
      */
-    private var implicitConfigJob: Deferred<Set<String>>? = null
+    private var implicitConfigJob: Deferred<Pair<Set<String>, Map<String, JsonPrimitive>>>? = null
     @Volatile private var implicitConfigRetryAt: Long = Long.MIN_VALUE
     private val implicitMutex = Mutex()
     private var lifecycleCancel: (() -> Unit)? = null
@@ -242,6 +242,20 @@ public class RevnixClient(private val config: RevnixConfig) {
         val minted = generateAnonymousId()
         config.storage.set(KEY_CUSTOMER_ID, minted)
         minted
+    }
+
+    /**
+     * Make this device act as [userId]. Your backend must call
+     * `POST /v1/identify` with a secret key to merge the anonymous customer's
+     * history; this only adopts the id locally. Blank or over-long ids are
+     * ignored and the current id is returned.
+     */
+    public fun identify(userId: String): String = synchronized(identityLock) {
+        val current = customerId()
+        val id = userId.trim()
+        if (id.isEmpty() || id.length > 200) return current
+        config.storage.set(KEY_CUSTOMER_ID, id)
+        id
     }
 
     /** Release the internal coroutine scope. */
@@ -466,6 +480,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             input.expiresAt?.let { put("expiresAt", JsonPrimitive(it)) }
             input.signedTransactionInfo?.let { put("signedTransactionInfo", JsonPrimitive(it)) }
             input.rawPayload?.let { put("rawPayload", it) }
+            input.decisionId?.let { put("decisionId", JsonPrimitive(it)) }
         }
         val raw = request("POST", listOf("v1", "purchases"), body)
         return decode(RegisterPurchaseResult.serializer(), raw)
@@ -756,7 +771,15 @@ public class RevnixClient(private val config: RevnixConfig) {
      * delivery fails — the caller's pairing must not depend on the network,
      * and the close beacon carries its own idempotency key.
      */
-    public suspend fun logPaywallDisplay(placementKey: String?, paywallId: String?): String {
+    public suspend fun logPaywallDisplay(
+        placementKey: String?,
+        paywallId: String?,
+        decisionId: String? = null,
+        priceShown: Double? = null,
+        screenIndex: Int? = null,
+        blockId: String? = null,
+        durationMs: Long? = null,
+    ): String {
         val viewId = UUID.randomUUID().toString().lowercase()
         if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return viewId
         // REV-272 LOOP GUARD: a display whose placement is one of the six came
@@ -777,6 +800,11 @@ public class RevnixClient(private val config: RevnixConfig) {
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
             placementKey?.let { put("placementKey", JsonPrimitive(it)) }
             paywallId?.let { put("paywallId", JsonPrimitive(it)) }
+            decisionId?.let { put("decisionId", JsonPrimitive(it)) }
+            priceShown?.takeIf { it.isFinite() && it >= 0 }?.let { put("priceShown", JsonPrimitive(it)) }
+            screenIndex?.let { put("screenIndex", JsonPrimitive(it)) }
+            blockId?.let { put("blockId", JsonPrimitive(it)) }
+            durationMs?.let { put("durationMs", JsonPrimitive(it)) }
         }
         try {
             request("POST", listOf("v1", "paywalls", "viewed"), body)
@@ -803,6 +831,11 @@ public class RevnixClient(private val config: RevnixConfig) {
         viewId: String,
         placementKey: String?,
         paywallId: String?,
+        decisionId: String? = null,
+        priceShown: Double? = null,
+        screenIndex: Int? = null,
+        blockId: String? = null,
+        durationMs: Long? = null,
     ) {
         if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return
         val body = buildJsonObject {
@@ -811,6 +844,11 @@ public class RevnixClient(private val config: RevnixConfig) {
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
             placementKey?.let { put("placementKey", JsonPrimitive(it)) }
             paywallId?.let { put("paywallId", JsonPrimitive(it)) }
+            decisionId?.let { put("decisionId", JsonPrimitive(it)) }
+            priceShown?.takeIf { it.isFinite() && it >= 0 }?.let { put("priceShown", JsonPrimitive(it)) }
+            screenIndex?.let { put("screenIndex", JsonPrimitive(it)) }
+            blockId?.let { put("blockId", JsonPrimitive(it)) }
+            durationMs?.let { put("durationMs", JsonPrimitive(it)) }
         }
         try {
             request("POST", listOf("v1", "paywalls", "closed"), body)
@@ -858,6 +896,11 @@ public class RevnixClient(private val config: RevnixConfig) {
         code: String? = null,
         message: String? = null,
         eventId: String? = null,
+        decisionId: String? = null,
+        priceShown: Double? = null,
+        screenIndex: Int? = null,
+        blockId: String? = null,
+        durationMs: Long? = null,
     ) {
         if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return
         val body = buildJsonObject {
@@ -874,6 +917,11 @@ public class RevnixClient(private val config: RevnixConfig) {
             // The server bounds `message` at 1024; trimming here keeps a long
             // localized store error from turning the whole report into a 400.
             message?.let { put("message", JsonPrimitive(it.take(1024))) }
+            decisionId?.let { put("decisionId", JsonPrimitive(it)) }
+            priceShown?.takeIf { it.isFinite() && it >= 0 }?.let { put("priceShown", JsonPrimitive(it)) }
+            screenIndex?.let { put("screenIndex", JsonPrimitive(it)) }
+            blockId?.let { put("blockId", JsonPrimitive(it)) }
+            durationMs?.let { put("durationMs", JsonPrimitive(it)) }
         }
         enqueueEvent(PAYWALL_EVENTS_PATH, body)
         // REV-272: backing out of the store sheet is the `transaction_abandon`
@@ -1321,12 +1369,21 @@ public class RevnixClient(private val config: RevnixConfig) {
     }
 
     /** Which of the six this app has configured. See [implicitConfigJob]. */
-    private suspend fun implicitConfig(): Set<String> {
+    private suspend fun implicitConfig(): Set<String> = remoteConfig().first
+
+    /**
+     * Feature flags from Settings → Flags in the dashboard, read once per
+     * launch from the same `/v1/config` fetch as implicit placements. Empty
+     * when the server has none or the fetch failed. Never throws.
+     */
+    public suspend fun flags(): Map<String, JsonPrimitive> = remoteConfig().second
+
+    private suspend fun remoteConfig(): Pair<Set<String>, Map<String, JsonPrimitive>> {
         val job = implicitMutex.withLock {
             implicitConfigJob ?: run {
                 // Inside the hold after a failure: answer "none" without a
                 // request.
-                if (config.now() < implicitConfigRetryAt) return emptySet()
+                if (config.now() < implicitConfigRetryAt) return emptySet<String>() to emptyMap()
                 scope.async {
                     // The id does not change the answer — this route is
                     // customer-independent — it only picks the server's
@@ -1338,9 +1395,13 @@ public class RevnixClient(private val config: RevnixConfig) {
                         query = mapOf("customer" to customerId()),
                     )
                     val obj = json.parseToJsonElement(raw).jsonObject
-                    obj["implicitPlacements"]?.let { element ->
+                    val placements = obj["implicitPlacements"]?.let { element ->
                         decode(stringListSerializer, element.toString()).toSet()
                     } ?: emptySet()
+                    val flags = (obj["flags"] as? JsonObject)
+                        ?.mapNotNull { (k, v) -> (v as? JsonPrimitive)?.takeIf { it !is JsonNull }?.let { k to it } }
+                        ?.toMap() ?: emptyMap()
+                    placements to flags
                 }.also { implicitConfigJob = it }
             }
         }
@@ -1351,7 +1412,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             implicitConfigRetryAt = config.now() + IMPLICIT_CONFIG_RETRY_HOLD_MS
             bgFailures += 1
             diagnostic("implicitConfig", err.message.orEmpty())
-            emptySet()
+            emptySet<String>() to emptyMap()
         }
     }
 
@@ -1561,6 +1622,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         val expiresAt: Long? = null,
         val signedTransactionInfo: String? = null,
         val rawPayload: JsonElement? = null,
+        val decisionId: String? = null,
         val queuedAt: Long? = null,
         val customerId: String? = null,
     ) {
@@ -1573,6 +1635,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             expiresAt = expiresAt,
             signedTransactionInfo = signedTransactionInfo,
             rawPayload = rawPayload,
+            decisionId = decisionId,
         )
     }
 
@@ -1664,6 +1727,7 @@ public class RevnixClient(private val config: RevnixConfig) {
             expiresAt = input.expiresAt,
             signedTransactionInfo = input.signedTransactionInfo,
             rawPayload = input.rawPayload,
+            decisionId = input.decisionId,
             queuedAt = config.now(),
             customerId = customerId,
         )

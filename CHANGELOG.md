@@ -4,6 +4,9 @@
 
 ### Added
 
+- `RevnixClient.flags()`: the feature flags set in Settings → Flags in the dashboard, read once per launch from the same `/v1/config` request as implicit placements. Empty when none are set or the request fails.
+- `RevnixClient.identify(userId)`: make the device act as an identified customer. Your backend still merges history with `POST /v1/identify` and a secret key. Blank or over-200-character ids are ignored.
+- `PlacementResolution.decisionId`, and optional `decisionId`, `priceShown`, `screenIndex`, `blockId`, `durationMs` on `logPaywallDisplay`, `logPaywallClosed` and `logPaywallEvent`; `RegisterPurchaseInput.decisionId`. `RevnixPaywallView.bind` takes `decisionId` and reports it with dwell time on close. `PlayBillingConnector.purchase` takes an optional `decisionId` and sends it with the purchase.
 - `RevnixConfig.consumableProductIds`: Play purchases of these products are consumed after Revnix records them, so they can be bought again. If the server is unreachable the purchase is acknowledged and queued, and consumed on a later restore. Purchases acknowledged by older versions are consumed on the next restore once listed. If consume fails, the SDK acknowledges instead and reports a diagnostic.
 - Buying a listed consumable that is still owned throws `BillingException` with `ITEM_ALREADY_OWNED` (retryable) after restoring it.
 

@@ -65,6 +65,7 @@ public class PlayBillingConnector internal constructor(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     internal val pending = mutableMapOf<String, CompletableDeferred<RegisterPurchaseResult?>>()
+    private val pendingDecisions = mutableMapOf<String, String>()
 
     private val purchasesUpdatedListener = PurchasesUpdatedListener { result, purchases ->
         when {
@@ -72,8 +73,9 @@ public class PlayBillingConnector internal constructor(
                 purchases.forEach { purchase ->
                     scope.launch {
                         val waiting = purchase.products.mapNotNull { pending.remove(it) }
+                        val decisionId = purchase.products.firstNotNullOfOrNull { pendingDecisions.remove(it) }
                         try {
-                            when (val outcome = register(purchase)) {
+                            when (val outcome = register(purchase, decisionId)) {
                                 is Registration.Registered -> waiting.forEach { it.complete(outcome.result) }
                                 is Registration.Queued -> waiting.forEach { it.completeExceptionally(outcome.err) }
                                 is Registration.Refused -> waiting.forEach { it.completeExceptionally(outcome.err) }
@@ -88,10 +90,12 @@ public class PlayBillingConnector internal constructor(
                 result.responseCode == BillingClient.BillingResponseCode.USER_CANCELED -> {
                 pending.values.forEach { it.complete(null) }
                 pending.clear()
+                pendingDecisions.clear()
             }
             result.responseCode == BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
                 val waiting = pending.toMap()
                 pending.clear()
+                pendingDecisions.clear()
                 scope.launch {
                     runCatching { restore() }
                     waiting.forEach { (productId, deferred) ->
@@ -108,6 +112,7 @@ public class PlayBillingConnector internal constructor(
                 val failure = billingFailure(result)
                 pending.values.forEach { it.completeExceptionally(failure) }
                 pending.clear()
+                pendingDecisions.clear()
             }
         }
     }
@@ -193,8 +198,14 @@ public class PlayBillingConnector internal constructor(
      * when Play charged but Revnix queued (acknowledged) or refused (not
      * acknowledged) the claim, [ProductNotFoundException] when Play has no such
      * product, and [BillingException] for any other Play failure.
+     * [decisionId] is the resolve's `PlacementResolution.decisionId`, sent with
+     * the purchase.
      */
-    public suspend fun purchase(activity: Activity, productId: String): RegisterPurchaseResult? =
+    public suspend fun purchase(
+        activity: Activity,
+        productId: String,
+        decisionId: String? = null,
+    ): RegisterPurchaseResult? =
         withContext(Dispatchers.Main.immediate) {
             val lookups = mutableListOf<BillingResult>()
             val details = listOf(BillingClient.ProductType.SUBS, BillingClient.ProductType.INAPP)
@@ -215,10 +226,12 @@ public class PlayBillingConnector internal constructor(
 
             val deferred = CompletableDeferred<RegisterPurchaseResult?>()
             pending.put(productId, deferred)?.complete(null)
+            if (decisionId != null) pendingDecisions[productId] = decisionId else pendingDecisions.remove(productId)
             // ponytail: first offer of the first base plan; take an offer token from the caller once a product sells several base plans.
             val launched = launchPurchase(activity, details, details.subscriptionOfferDetails?.firstOrNull()?.offerToken)
             if (launched.responseCode == BillingClient.BillingResponseCode.OK) return@withContext deferred.await()
             pending.remove(productId)
+            pendingDecisions.remove(productId)
             when (launched.responseCode) {
                 BillingClient.BillingResponseCode.USER_CANCELED -> null
                 BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED -> {
@@ -258,7 +271,7 @@ public class PlayBillingConnector internal constructor(
         data object Pending : Registration
     }
 
-    private suspend fun register(purchase: Purchase): Registration {
+    private suspend fun register(purchase: Purchase, decisionId: String? = null): Registration {
         if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) return Registration.Pending
         val input = RegisterPurchaseInput(
             source = RevnixStore.GOOGLE,
@@ -267,6 +280,7 @@ public class PlayBillingConnector internal constructor(
             productId = purchase.products.firstOrNull().orEmpty(),
             transactionId = purchase.purchaseToken,
             occurredAt = purchase.purchaseTime,
+            decisionId = decisionId,
         )
 
         val outcome = try {
@@ -316,6 +330,7 @@ public class PlayBillingConnector internal constructor(
         billing.endConnection()
         pending.values.forEach { it.completeExceptionally(BillingException(-1, "billing closed", false)) }
         pending.clear()
+        pendingDecisions.clear()
         scope.cancel()
     }
 
