@@ -81,6 +81,8 @@ public data class RegisterPurchaseInput(
     /** StoreKit 2 JWS — the proof path; claims without it are provisional. */
     val signedTransactionInfo: String? = null,
     val rawPayload: JsonElement? = null,
+    /** [PlacementResolution.decisionId] of the paywall that led to this purchase. */
+    val decisionId: String? = null,
 )
 
 @Serializable
@@ -277,6 +279,8 @@ public data class PlacementResolution(
     val experimentJson: JsonElement? = null,
     /** Set only on a dashboard QR/link preview resolution, never on a real resolve. */
     val preview: Boolean? = null,
+    /** Id of this resolve decision; null on older servers. Pass it to the paywall and purchase reports. */
+    val decisionId: String? = null,
 )
 
 /**
@@ -300,6 +304,7 @@ internal object PlacementResolutionSerializer : KSerializer<PlacementResolution>
         val offering: PlacementOffering,
         val paywall: JsonElement? = null,
         val experiment: JsonElement? = null,
+        val decisionId: String? = null,
     )
 
     override val descriptor: SerialDescriptor = Wire.serializer().descriptor
@@ -324,6 +329,7 @@ internal object PlacementResolutionSerializer : KSerializer<PlacementResolution>
             },
             paywallJson = paywallJson,
             experimentJson = experimentJson,
+            decisionId = wire.decisionId,
         )
     }
 
@@ -338,6 +344,7 @@ internal object PlacementResolutionSerializer : KSerializer<PlacementResolution>
                 ?: value.paywall?.let { json.encodeToJsonElement(PlacementPaywall.serializer(), it) },
             experiment = value.experimentJson
                 ?: value.experiment?.let { json.encodeToJsonElement(PlacementExperiment.serializer(), it) },
+            decisionId = value.decisionId,
         )
         encoder.encodeSerializableValue(Wire.serializer(), wire)
     }

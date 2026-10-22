@@ -237,6 +237,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
     private var viewReport: Deferred<String?>? = null
     private var reportPlacementKey: String? = null
     private var reportPaywallId: String? = null
+    private var reportDecisionId: String? = null
 
     /** The packages the active template actually shows ("minimal" filters). */
     private var shownPackages: List<RevnixPaywallPackage> = emptyList()
@@ -329,6 +330,9 @@ public class RevnixPaywallView @JvmOverloads constructor(
      *   display's own view id.
      * @param disableViewTracking Opt out of the automatic view report while
      *   still passing [client].
+     * @param decisionId [com.revnix.PlacementResolution.decisionId] of the
+     *   resolve that produced this paywall; sent with the view, interaction
+     *   and close reports.
      */
     public fun bind(
         config: PaywallConfig,
@@ -345,6 +349,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         placementKey: String? = null,
         paywallId: String? = null,
         disableViewTracking: Boolean = false,
+        decisionId: String? = null,
     ) {
         this.config = config
         this.packages = packages
@@ -370,11 +375,12 @@ public class RevnixPaywallView @JvmOverloads constructor(
         this.diagnosticClient = client
         this.reportPlacementKey = placementKey
         this.reportPaywallId = paywallId
+        this.reportDecisionId = decisionId
         render()
         if (client != null && !disableViewTracking) {
             // Fire-and-forget; the client swallows failures into diagnostics
             // and dispatches to IO internally.
-            viewReport = viewScope.async { client.logPaywallDisplay(placementKey, paywallId) }
+            viewReport = viewScope.async { client.logPaywallDisplay(placementKey, paywallId, decisionId = decisionId) }
             // REV-263: an offering with nothing to sell is the one failure the
             // view can see by itself, and the one most worth knowing about —
             // the paywall painted, the customer could not buy.
@@ -407,6 +413,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
         val report = viewReport ?: return
         val placementKey = reportPlacementKey
         val paywallId = reportPaywallId
+        val decisionId = reportDecisionId
         viewScope.launch {
             // Awaiting the view beacon for the same reason the close does: an
             // interaction reported before the display id exists could not be
@@ -421,6 +428,7 @@ public class RevnixPaywallView @JvmOverloads constructor(
                 code = code,
                 message = message,
                 eventId = eventId?.let { "$id:$it" },
+                decisionId = decisionId,
             )
         }
     }
@@ -472,13 +480,15 @@ public class RevnixPaywallView @JvmOverloads constructor(
         val report = viewReport ?: return
         val placementKey = reportPlacementKey
         val paywallId = reportPaywallId
+        val decisionId = reportDecisionId
+        val durationMs = (System.currentTimeMillis() - displayedAt).coerceAtLeast(0)
         viewScope.launch {
             // Awaiting the view beacon is what keeps the pair intact when the
             // customer dismisses before it lands. It has usually finished long
             // ago, in which case this resumes immediately. A cancelled beacon
             // (the view was rebound or detached) reports nothing.
             val id = runCatching { report.await() }.getOrNull() ?: return@launch
-            client.logPaywallClosed(id, placementKey, paywallId)
+            client.logPaywallClosed(id, placementKey, paywallId, decisionId = decisionId, durationMs = durationMs)
         }
     }
 
