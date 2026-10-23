@@ -90,8 +90,9 @@ appScope.launch { if (client.isEntitled("pro")) { /* … */ } }
 Consumable products: list their ids in `RevnixConfig.consumableProductIds` (a `Set<String>`) and the connector consumes them after Revnix records the purchase, so they can be bought again.
 
 Use the **publishable** key (`rvx_pk_…`) only. Secret keys must never ship in a
-binary, so `identify`/`alias` are deliberately not SDK methods; proxy them from
-your server (see the docs recipe).
+binary, so the merge and `alias` are not SDK methods; proxy them from your
+server (see the docs recipe). `identify(userId)` only adopts your user id on the
+device, with no network call.
 
 ## Paywalls and A/B tests
 
@@ -560,6 +561,7 @@ agreement with it and with the Swift port.
 | Deliberate rejection (401/403/404/409) | **Always throw**: a cache must never defeat a kill-switch |
 | Cached entitlement past `expiresAt` | Grace 3 days, then inactive |
 | Cache age ceiling | 14 days → all inactive |
+| Cached snapshot | Used only if its `Revnix-Signature` verifies for this API key and customer; otherwise no cache |
 | Clock rolled back > 5 min | All inactive |
 | Repeat reads | 30 s soft TTL + in-flight coalescing |
 | Failed purchase registration | Persistent queue keyed `source:token:transactionId`, retryable failures only |
@@ -591,5 +593,5 @@ purchases in a sandbox app, not by either suite.
 
 ## Not in v1
 
-- `identify` / `alias`: server-proxied by design.
+- `alias` and the `identify` merge: server-proxied by design (`identify(userId)` adopts the id on the device).
 - Amazon and other stores.
