@@ -1,5 +1,10 @@
 package com.revnix
 
+import java.security.KeyPairGenerator
+import java.security.PrivateKey
+import java.security.Signature
+import java.security.spec.ECGenParameterSpec
+import java.util.Base64
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
@@ -20,6 +25,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.double
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
@@ -32,6 +39,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import okhttp3.mockwebserver.SocketPolicy
+import okio.ByteString.Companion.encodeUtf8
 
 /**
  * Behavior tests ported from revnix-react's `resilience.test.ts` — that file is
@@ -100,6 +108,7 @@ class RevnixClientTest {
     }
 
     private fun makeClient(
+        apiKey: String = "rvx_pk_test_abc",
         now: () -> Long = { System.currentTimeMillis() },
         storage: RevnixStorage = MemoryStorage(),
         timeout: Duration = 10.seconds,
@@ -117,7 +126,7 @@ class RevnixClientTest {
         advertisingId: (suspend () -> String?)? = null,
     ): RevnixClient = RevnixClient(
         RevnixConfig(
-            apiKey = "rvx_pk_test_abc",
+            apiKey = apiKey,
             baseUrl = server.url("/").toString().trimEnd('/'),
             storage = storage,
             timeout = timeout,
@@ -136,7 +145,8 @@ class RevnixClientTest {
             onAttribution = onAttribution,
             deviceIntegrity = deviceIntegrity,
             advertisingId = advertisingId,
-        )
+        ),
+        listOf(testKeys.public),
     ).also { clients += it }
 
     /** REV-268: a fixed device so the header is deterministic under test. */
@@ -157,8 +167,14 @@ class RevnixClientTest {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val path = request.path.orEmpty()
                 val rule = rules.firstOrNull { path.contains(it.first) }
-                return rule?.second?.invoke(request)
+                val response = rule?.second?.invoke(request)
                     ?: MockResponse().setResponseCode(404).setBody("""{"error":"no stub"}""")
+                val signedAt = response.headers["Revnix-Signed-At"]?.toLongOrNull()
+                if (path.contains("/entitlements") && signedAt != null && response.headers["Revnix-Signature"] == null) {
+                    val body = response.getBody()!!.clone().readUtf8()
+                    signatureHeaders(body, entitlementsCid(request), signedAt).forEach { (k, v) -> response.setHeader(k, v) }
+                }
+                return response
             }
         }
     }
@@ -166,8 +182,37 @@ class RevnixClientTest {
     private fun json(status: Int, body: String, headers: Map<String, String> = emptyMap()) =
         MockResponse().setResponseCode(status)
             .setHeader("Content-Type", "application/json")
+            .apply { if (status == 200) setHeader("Revnix-Signed-At", System.currentTimeMillis()) }
             .apply { headers.forEach { (k, v) -> setHeader(k, v) } }
             .setBody(body)
+
+    private fun entitlementsCid(request: RecordedRequest) = request.requestUrl!!.pathSegments[2]
+
+    private fun signatureHeaders(
+        body: String,
+        cid: String,
+        signedAt: Long = System.currentTimeMillis(),
+        key: PrivateKey = testKeys.private,
+        apiKey: String = "rvx_pk_test_abc",
+    ): Map<String, String> {
+        val keyHash = apiKey.encodeUtf8().sha256().hex()
+        val cidHash = cid.encodeUtf8().sha256().hex()
+        val signature = Signature.getInstance("SHA256withECDSA").run {
+            initSign(key)
+            update("$signedAt.$keyHash.$cidHash.$body".toByteArray(Charsets.UTF_8))
+            sign()
+        }
+        return mapOf(
+            "Revnix-Signed-At" to signedAt.toString(),
+            "Revnix-Signature" to Base64.getEncoder().encodeToString(signature),
+        )
+    }
+
+    private fun editCacheEntry(storage: RevnixStorage, cid: String, edit: (JsonObject) -> Map<String, JsonPrimitive>) {
+        val key = "revnix.ent.$cid"
+        val entry = Json.parseToJsonElement(storage.get(key)!!).jsonObject
+        storage.set(key, JsonObject(entry + edit(entry)).toString())
+    }
 
     /** Serves [first] once, then [then] for every later call. */
     private fun onceThen(first: MockResponse, then: () -> MockResponse): (RecordedRequest) -> MockResponse {
@@ -299,6 +344,154 @@ class RevnixClientTest {
         assertEquals(true, cached?.stale)
         assertEquals("pro", cached?.entitlements?.first()?.entitlementId)
         assertEquals(1, server.requestCount)
+    }
+
+    @Test
+    fun `a signed snapshot survives into a new client and serves offline`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody)) { disconnect() })
+        val storage = MemoryStorage()
+        makeClient(storage = storage).entitlements()
+
+        val offline = makeClient(storage = storage, entitlementsTtl = Duration.ZERO).entitlements()
+        assertEquals(true, offline.stale)
+        assertEquals(true, offline.entitlements.first().isActive)
+    }
+
+    @Test
+    fun `a tampered body, a tampered signature or a legacy entry is not served`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody(1L))) { disconnect() })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage, entitlementsTtl = Duration.ZERO)
+        client.entitlements()
+        val cid = client.customerId()
+        val original = storage.get("revnix.ent.$cid")!!
+        assertNotNull(client.cachedEntitlements())
+
+        editCacheEntry(storage, cid) { mapOf("body" to JsonPrimitive(entitlementsBody)) }
+        assertNull(client.cachedEntitlements())
+        assertFailsWith<RevnixError.Network> { client.entitlements() }
+
+        storage.set("revnix.ent.$cid", original)
+        editCacheEntry(storage, cid) {
+            mapOf("signature" to JsonPrimitive(signatureHeaders(entitlementsBody, cid).getValue("Revnix-Signature")))
+        }
+        assertNull(client.cachedEntitlements())
+
+        storage.set(
+            "revnix.ent.$cid",
+            """{"snapshot":$entitlementsBody,"fetchedAt":${System.currentTimeMillis()}}""",
+        )
+        assertNull(client.cachedEntitlements())
+    }
+
+    @Test
+    fun `a future fetchedAt extends neither the TTL nor the offline window`() = runBlocking {
+        val clock = TestClock(System.currentTimeMillis())
+        val calls = AtomicInteger(0)
+        route("/entitlements" to {
+            if (calls.getAndIncrement() == 0) {
+                json(200, entitlementsBody, mapOf("Revnix-Signed-At" to clock.now().toString()))
+            } else {
+                json(500, """{"error":"down"}""")
+            }
+        })
+        val storage = MemoryStorage()
+        val client = makeClient(now = clock::now, storage = storage)
+        client.entitlements()
+        editCacheEntry(storage, client.customerId()) { mapOf("fetchedAt" to JsonPrimitive(clock.now() + 20 * dayMs)) }
+
+        clock.advance(60_000)
+        assertEquals(true, client.entitlements().stale)
+        assertEquals(2, calls.get())
+
+        clock.advance(15 * dayMs)
+        val served = client.entitlements()
+        assertEquals(true, served.stale)
+        assertEquals(false, served.entitlements.first().isActive)
+    }
+
+    @Test
+    fun `a response without signature headers is returned but never cached`() = runBlocking {
+        route("/entitlements" to {
+            MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(entitlementsBody)
+        })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+
+        assertEquals(7L, client.entitlements().cursor)
+        assertNull(storage.get("revnix.ent.${client.customerId()}"))
+        assertNull(client.cachedEntitlements())
+    }
+
+    @Test
+    fun `an unsigned read drops the older signed entry`() = runBlocking {
+        route("/entitlements" to { json(200, entitlementsBody) })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage, entitlementsTtl = Duration.ZERO)
+        client.entitlements()
+        assertNotNull(storage.get("revnix.ent.${client.customerId()}"))
+
+        route("/entitlements" to {
+            MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(entitlementsBody)
+        })
+        client.entitlements()
+        assertNull(storage.get("revnix.ent.${client.customerId()}"))
+    }
+
+    @Test
+    fun `a snapshot signed by an unpinned key is rejected`() = runBlocking {
+        val stranger = KeyPairGenerator.getInstance("EC")
+            .apply { initialize(ECGenParameterSpec("secp256r1")) }
+            .generateKeyPair()
+        route("/entitlements" to {
+            json(200, entitlementsBody, signatureHeaders(entitlementsBody, entitlementsCid(it), key = stranger.private))
+        })
+        val client = makeClient()
+
+        assertEquals(false, client.entitlements().stale)
+        assertNull(client.cachedEntitlements())
+    }
+
+    @Test
+    fun `a snapshot signed for another customer is rejected`() = runBlocking {
+        route("/entitlements" to { json(200, entitlementsBody, signatureHeaders(entitlementsBody, "someone_else")) })
+        val client = makeClient()
+
+        assertEquals(false, client.entitlements().stale)
+        assertNull(client.cachedEntitlements())
+    }
+
+    @Test
+    fun `a snapshot signed for another api key is rejected`() = runBlocking {
+        route("/entitlements" to {
+            json(200, entitlementsBody, signatureHeaders(entitlementsBody, entitlementsCid(it), apiKey = "rvx_pk_test_other"))
+        })
+        val client = makeClient()
+
+        assertEquals(false, client.entitlements().stale)
+        assertNull(client.cachedEntitlements())
+    }
+
+    @Test
+    fun `the key hash is taken over the trimmed api key`() = runBlocking {
+        route("/entitlements" to { json(200, entitlementsBody) })
+        val client = makeClient(apiKey = "rvx_pk_test_abc ")
+        client.entitlements()
+
+        assertEquals(true, client.cachedEntitlements()?.entitlements?.first()?.isActive)
+    }
+
+    @Test
+    fun `tampering storage after a verified read is still rejected`() = runBlocking {
+        route("/entitlements" to { json(200, entitlementsBody(1L)) })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+        client.entitlements()
+        assertEquals(false, client.cachedEntitlements()!!.entitlements.first().isActive)
+        assertEquals(false, client.cachedEntitlements()!!.entitlements.first().isActive)
+
+        editCacheEntry(storage, client.customerId()) { mapOf("body" to JsonPrimitive(entitlementsBody)) }
+        assertNull(client.cachedEntitlements())
     }
 
     // MARK: - Local expiry grace (spec: "REV-157 local expiry")
@@ -1849,7 +2042,7 @@ class RevnixClientTest {
 
         client.track("a", eventId = "e1")
         client.flushEvents()
-        assertEquals(1, queuedEventCount(storage))
+        awaitCondition { queuedEventCount(storage) == 1 }
 
         client.flushEvents()
         assertEquals(1, server.requestCount)
@@ -1870,7 +2063,7 @@ class RevnixClientTest {
         client.flushEvents()
 
         assertEquals(1, server.requestCount)
-        assertEquals(1, queuedEventCount(storage))
+        awaitCondition { queuedEventCount(storage) == 1 }
     }
 
     @Test
@@ -1932,12 +2125,39 @@ class RevnixClientTest {
 
         client.track("a", eventId = "newest")
 
+        awaitCondition { storage.get("revnix.eventQueue")!!.contains("newest") }
         val ids = kotlinx.serialization.json.Json.parseToJsonElement(storage.get("revnix.eventQueue")!!).jsonArray
             .map { it.jsonObject["body"]!!.jsonObject["eventId"]!!.jsonPrimitive.content }
         assertEquals(1000, ids.size)
         assertEquals("s1", ids.first())
         assertEquals("newest", ids.last())
         assertTrue(diagnostics.any { it.op == "eventQueue" && it.message == "dropped 1 oldest" })
+    }
+
+    @Test
+    fun `a burst of events writes storage at most twice and survives into a new client`() = runBlocking {
+        route("v1/events" to { json(200, """{"results":[]}""") })
+        val storage = CountingStorage("revnix.eventQueue")
+        val client = makeClient(storage = storage)
+
+        repeat(15) { client.track("burst", eventId = "b$it") }
+        awaitCondition { queuedEventCount(storage) == 15 }
+        assertTrue(storage.writes.get() in 1..2)
+        client.close()
+
+        makeClient(storage = storage).flushEvents()
+        val request = server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!
+        assertEquals((0 until 15).map { "b$it" }, batchEvents(request).map { it["eventId"]!!.jsonPrimitive.content })
+    }
+
+    @Test
+    fun `close writes events still waiting for the coalesced persist`() = runBlocking {
+        val storage = CountingStorage("revnix.eventQueue")
+        val client = makeClient(storage = storage)
+
+        client.track("late", eventId = "l1")
+        client.close()
+        assertEquals(1, queuedEventCount(storage))
     }
 
     @Test
@@ -1949,6 +2169,28 @@ class RevnixClientTest {
 
         val request = server.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)!!
         assertEquals("left", batchEvents(request).single()["eventId"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `an event tracked after close is written at once`() = runBlocking {
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+        client.close()
+
+        client.track("late", eventId = "l1")
+        assertEquals(1, queuedEventCount(storage))
+    }
+
+    @Test
+    fun `going to the background writes events still waiting for the coalesced persist`() = runBlocking {
+        route("v1/events" to { json(503, """{"error":"unavailable"}""") })
+        val (lifecycle, handler) = fakeLifecycle()
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage, lifecycle = lifecycle)
+
+        client.track("a", eventId = "e1")
+        handler()!!.invoke(RevnixAppState.BACKGROUND)
+        assertEquals(1, queuedEventCount(storage))
     }
 
     @Test
@@ -2303,5 +2545,25 @@ private class SlowGetStorage(
     }
 
     override fun set(key: String, value: String) = delegate.set(key, value)
+    override fun remove(key: String) = delegate.remove(key)
+}
+
+private val testKeys = KeyPairGenerator.getInstance("EC")
+    .apply { initialize(ECGenParameterSpec("secp256r1")) }
+    .generateKeyPair()
+
+private class CountingStorage(
+    private val countedKey: String,
+    private val delegate: RevnixStorage = MemoryStorage(),
+) : RevnixStorage {
+    val writes = AtomicInteger(0)
+
+    override fun get(key: String): String? = delegate.get(key)
+
+    override fun set(key: String, value: String) {
+        if (key == countedKey) writes.incrementAndGet()
+        delegate.set(key, value)
+    }
+
     override fun remove(key: String) = delegate.remove(key)
 }

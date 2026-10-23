@@ -3,7 +3,11 @@ package com.revnix
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.URLDecoder
+import java.security.KeyFactory
 import java.security.MessageDigest
+import java.security.PublicKey
+import java.security.Signature
+import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import java.util.Collections
 import java.util.Locale
@@ -22,6 +26,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -43,11 +48,14 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.ByteString.Companion.decodeBase64
+import okio.ByteString.Companion.encodeUtf8
 
 /**
  * Core client — a faithful port of revnix-react's resilience policy
@@ -62,7 +70,12 @@ import okhttp3.RequestBody.Companion.toRequestBody
  *   `source:token:transactionId` and drain idempotently (the server dedupes on
  *   the shared purchaseKey).
  */
-public class RevnixClient(private val config: RevnixConfig) {
+public class RevnixClient internal constructor(
+    private val config: RevnixConfig,
+    private val entitlementKeys: List<PublicKey>,
+) {
+
+    public constructor(config: RevnixConfig) : this(config, PINNED_ENTITLEMENT_KEYS.map(::ecPublicKey))
 
     /** [RevnixConfig.consumableProductIds], for the Play connector. */
     public val consumableProductIds: Set<String> get() = config.consumableProductIds
@@ -90,6 +103,10 @@ public class RevnixClient(private val config: RevnixConfig) {
     private val eventQueueLock = Any()
     private val eventFlushMutex = Mutex()
     private var eventFlushTimer: Job? = null
+    private var eventQueue: MutableList<QueuedEvent>? = null
+    private var eventPersistJob: Job? = null
+    private val verifiedCacheEntries = Collections.synchronizedMap(mutableMapOf<String, Pair<String, CacheEntry?>>())
+    private val apiKeyHash = sha256Hex(config.apiKey.trim())
     @Volatile private var eventRetryAt: Long = Long.MIN_VALUE
 
     private val integrityMutex = Mutex()
@@ -206,6 +223,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         private const val EVENT_FLUSH_DELAY_MS = 10_000L
         private const val EVENT_LAUNCH_FLUSH_DELAY_MS = 2_000L
         private const val EVENT_RETRY_HOLD_MS = 30_000L
+        private const val EVENT_PERSIST_DELAY_MS = 1_000L
         private const val PURCHASE_QUEUE_CAP = 100
         private const val PURCHASE_MAX_AGE_MS = 30L * 24 * 3600 * 1000
         private const val PLACEMENT_CACHE_FRESH_MS = 24L * 3600 * 1000
@@ -213,6 +231,11 @@ public class RevnixClient(private val config: RevnixConfig) {
 
         private val PREVIEW_TOKEN_REGEX = Regex("[?&]revnix_preview=([0-9a-f]{64})(?:[&#]|$)")
         private val TRACK_EVENT_NAME_REGEX = Regex("^[a-z0-9_]{1,64}$")
+
+        private val PINNED_ENTITLEMENT_KEYS = listOf(
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEsVQ+iVnl3H7IWe6uma8VASdqlJ09SrtOIKpxB5vF1xF7f3nD+SBzXlse1+skTi/jv/CLa4fUz9qGfZ4T8M+Nhw==",
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEzGACMgBMy29LVcpzlmUFBRi4aiCB0FSitlLcO0k8fJ9q3foy22k2twy2U/qL0yVJHKQWWIEmt96dchyGlgDZHQ==",
+        )
 
         /**
          * Forces every paywall rendered after this call to [tag]'s language
@@ -265,6 +288,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         lifecycleCancel?.invoke()
         lifecycleCancel = null
         scope.cancel()
+        persistPendingEvents()
     }
 
     // MARK: - Entitlements
@@ -305,10 +329,19 @@ public class RevnixClient(private val config: RevnixConfig) {
         nowMs: Long,
         timeoutMs: Long? = null,
     ): CustomerEntitlements {
-        val raw = request("GET", listOf("v1", "customers", cid, "entitlements"), timeoutMs = timeoutMs)
+        var headers: Headers? = null
+        val raw = request("GET", listOf("v1", "customers", cid, "entitlements"), timeoutMs = timeoutMs) {
+            headers = it
+        }
         val snapshot = decode(CustomerEntitlements.serializer(), raw)
             .copy(stale = false, fetchedAt = nowMs)
-        storeCacheEntry(CacheEntry(snapshot, nowMs), cid)
+        val signedAt = headers?.get("Revnix-Signed-At")
+        val signature = headers?.get("Revnix-Signature")
+        if (signedAt != null && signature != null) {
+            storeCacheEntry(SignedCacheEntry(raw, signedAt, signature, nowMs), cid)
+        } else {
+            config.storage.remove(cacheKey(cid))
+        }
         return snapshot
     }
 
@@ -1026,7 +1059,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                 armFlushTimer(eventRetryAt - now)
                 return
             }
-            val snapshot = synchronized(eventQueueLock) { queuedEvents() }
+            val snapshot = synchronized(eventQueueLock) { queuedEvents().toList() }
             for ((path, items) in snapshot.groupBy { it.path }) {
                 for (chunk in items.chunked(EVENT_BATCH_MAX)) {
                     val body = buildJsonObject { put("events", JsonArray(chunk.map { it.body })) }
@@ -1165,7 +1198,10 @@ public class RevnixClient(private val config: RevnixConfig) {
         val lifecycle = config.lifecycle ?: return
         lifecycleCancel = runCatching {
             lifecycle.onStateChange { state ->
-                if (state == RevnixAppState.BACKGROUND) scope.launch { flushEvents() }
+                if (state == RevnixAppState.BACKGROUND) {
+                    persistPendingEvents()
+                    scope.launch { flushEvents() }
+                }
                 if (implicitEnabled) onAppState(state)
             }
         }.getOrElse {
@@ -1540,6 +1576,7 @@ public class RevnixClient(private val config: RevnixConfig) {
         query: Map<String, String> = emptyMap(),
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long? = null,
+        onHeaders: ((Headers) -> Unit)? = null,
     ): String = withContext(Dispatchers.IO) {
         val url = config.baseUrl.toHttpUrl().newBuilder().apply {
             segments.forEach { addPathSegment(it) }
@@ -1585,6 +1622,7 @@ public class RevnixClient(private val config: RevnixConfig) {
                     }.getOrNull().orEmpty()
                     throw RevnixError.fromHttp(it.code, message, it.header("Retry-After"))
                 }
+                onHeaders?.invoke(it.headers)
                 text
             }
         } catch (err: InterruptedIOException) {
@@ -1608,8 +1646,15 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     // MARK: - Cache plumbing
 
-    @Serializable
     private data class CacheEntry(val snapshot: CustomerEntitlements, val fetchedAt: Long)
+
+    @Serializable
+    private data class SignedCacheEntry(
+        val body: String,
+        val signedAt: String,
+        val signature: String,
+        val fetchedAt: Long,
+    )
 
     @Serializable
     private data class QueuedPurchase(
@@ -1669,12 +1714,37 @@ public class RevnixClient(private val config: RevnixConfig) {
     }
 
     private fun cacheEntry(cid: String): CacheEntry? {
-        val raw = config.storage.get(cacheKey(cid)) ?: return null
-        return runCatching { json.decodeFromString(CacheEntry.serializer(), raw) }.getOrNull()
+        val raw = config.storage.get(cacheKey(cid))
+        if (raw == null) {
+            verifiedCacheEntries.remove(cid)
+            return null
+        }
+        verifiedCacheEntries[cid]?.let { (verifiedRaw, entry) -> if (verifiedRaw == raw) return entry }
+        return verifyCacheEntry(cid, raw).also { verifiedCacheEntries[cid] = raw to it }
     }
 
-    private fun storeCacheEntry(entry: CacheEntry, cid: String) {
-        config.storage.set(cacheKey(cid), json.encodeToString(CacheEntry.serializer(), entry))
+    private fun verifyCacheEntry(cid: String, raw: String): CacheEntry? {
+        val entry = runCatching { json.decodeFromString(SignedCacheEntry.serializer(), raw) }.getOrNull() ?: return null
+        val signedAt = entry.signedAt.toLongOrNull() ?: return null
+        val signature = entry.signature.decodeBase64()?.toByteArray() ?: return null
+        val message = "${entry.signedAt}.$apiKeyHash.${sha256Hex(cid)}.${entry.body}".toByteArray(Charsets.UTF_8)
+        val verified = entitlementKeys.any { key ->
+            runCatching {
+                Signature.getInstance("SHA256withECDSA").run {
+                    initVerify(key)
+                    update(message)
+                    verify(signature)
+                }
+            }.getOrDefault(false)
+        }
+        if (!verified) return null
+        val snapshot = runCatching { json.decodeFromString(CustomerEntitlements.serializer(), entry.body) }
+            .getOrNull() ?: return null
+        return CacheEntry(snapshot, minOf(entry.fetchedAt, signedAt))
+    }
+
+    private fun storeCacheEntry(entry: SignedCacheEntry, cid: String) {
+        config.storage.set(cacheKey(cid), json.encodeToString(SignedCacheEntry.serializer(), entry))
         // LRU over recent customers so a shared device can't grow unbounded.
         val index = readIndex().toMutableList()
         index.remove(cid)
@@ -1745,13 +1815,39 @@ public class RevnixClient(private val config: RevnixConfig) {
         synchronized(queueLock) { persistQueue(queuedItems().filterNot { it.key == key }) }
     }
 
-    private fun queuedEvents(): List<QueuedEvent> {
-        val raw = config.storage.get(KEY_EVENT_QUEUE) ?: return emptyList()
-        return runCatching { json.decodeFromString(eventQueueSerializer, raw) }.getOrElse { emptyList() }
+    private fun queuedEvents(): MutableList<QueuedEvent> = eventQueue ?: run {
+        val raw = config.storage.get(KEY_EVENT_QUEUE)
+        val stored = raw?.let { runCatching { json.decodeFromString(eventQueueSerializer, it) }.getOrNull() }
+        stored.orEmpty().toMutableList().also { eventQueue = it }
     }
 
-    private fun persistEvents(items: List<QueuedEvent>) {
-        config.storage.set(KEY_EVENT_QUEUE, json.encodeToString(eventQueueSerializer, items))
+    private fun persistEvents() {
+        config.storage.set(KEY_EVENT_QUEUE, json.encodeToString(eventQueueSerializer, queuedEvents()))
+    }
+
+    private fun persistPendingEvents() {
+        synchronized(eventQueueLock) {
+            val pending = eventPersistJob ?: return
+            pending.cancel()
+            eventPersistJob = null
+            persistEvents()
+        }
+    }
+
+    // ponytail: events persist at most once a second, and at once on background or close; a crash, or a second client on the same storage, inside that window loses them.
+    private fun schedulePersistEvents() {
+        if (eventPersistJob != null) return
+        if (!scope.isActive) {
+            persistEvents()
+            return
+        }
+        eventPersistJob = scope.launch {
+            delay(EVENT_PERSIST_DELAY_MS)
+            synchronized(eventQueueLock) {
+                eventPersistJob = null
+                persistEvents()
+            }
+        }
     }
 
     private fun enqueueEvent(path: String, body: JsonObject) {
@@ -1759,8 +1855,10 @@ public class RevnixClient(private val config: RevnixConfig) {
         val size = synchronized(eventQueueLock) {
             val items = queuedEvents()
             dropped = (items.size - EVENT_QUEUE_CAP + 1).coerceAtLeast(0)
-            persistEvents(items.drop(dropped) + QueuedEvent(path, body))
-            items.size - dropped + 1
+            repeat(dropped) { items.removeAt(0) }
+            items.add(QueuedEvent(path, body))
+            schedulePersistEvents()
+            items.size
         }
         if (dropped > 0) diagnostic("eventQueue", "dropped $dropped oldest")
         if (size >= EVENT_FLUSH_AT) {
@@ -1784,9 +1882,9 @@ public class RevnixClient(private val config: RevnixConfig) {
 
     private fun removeEvents(sent: List<QueuedEvent>) {
         synchronized(eventQueueLock) {
-            val remaining = queuedEvents().toMutableList()
+            val remaining = queuedEvents()
             sent.forEach { remaining.remove(it) }
-            persistEvents(remaining)
+            persistEvents()
         }
     }
 
@@ -1821,6 +1919,11 @@ private val DEEP_LINK_REPORTED_PARAMS = setOf(
 )
 
 private val DEEP_LINK_USERINFO = Regex("^([A-Za-z][A-Za-z0-9+.-]*://)[^/\\\\]*@")
+
+private fun sha256Hex(value: String): String = value.encodeUtf8().sha256().hex()
+
+private fun ecPublicKey(spki: String): PublicKey =
+    KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(spki.decodeBase64()!!.toByteArray()))
 
 internal fun redactDeepLink(url: String): String {
     val beforeFragment = url.substringBefore('#')
