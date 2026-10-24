@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.10.0 (2026-10-24)
+
 ### Changed
 
 - Entitlement cache is signed. The server signs each `GET /v1/customers/{customerId}/entitlements` 200 (ECDSA P-256 / SHA-256, `Revnix-Signed-At` and `Revnix-Signature` headers, bound to the API key and customer id). The SDK pins Revnix's public keys and only trusts a cached snapshot whose signature verifies for its own API key and customer; a tampered, legacy or foreign snapshot is treated as no cache. Cache age comes from the signed server time, so editing the stored time cannot extend the 30 s soft TTL or the 14-day offline window. A 200 without signature headers is returned but not cached, and drops an older cached entry. After upgrading, the first offline launch has no cached entitlements until one online read, and an offline cache needs the server to sign. This stops edits to the cache file, not a user who patches the app binary on a rooted or jailbroken device.
@@ -28,11 +30,14 @@
 - Minting the anonymous customer id is thread-safe; a logout during an in-flight purchase is no longer overwritten.
 
 ## 1.8.0 (2026-10-14)
+## 1.8.0 (2026-10-14)
 
 ### Added
 
 - Paywall blocks: onboarding `screens` shown before the paywall, with `next` / `back` actions on text, image and button blocks and progress dots while an onboarding screen is showing.
 
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
 ## 1.7.0 (2026-10-13)
 ## 1.7.0 (2026-10-13)
 
@@ -41,6 +46,10 @@
 - `advertisingId = googleAdvertisingId(context)` stores the Google Advertising ID on the customer as `gps_adid` after `registerInstall`, resent only when it changes and deleted after an opt-out; needs `com.google.android.gms:play-services-ads-identifier` and the `com.google.android.gms.permission.AD_ID` permission in the app; without them, or after an opt-out, nothing is stored.
 - Paywall blocks: `timer` (countdown to a date or from when the paywall opens), `video` (muted looping clip with a poster), `toggle` (free-trial switch that flips the selected package) and the card `carousel` layout (swipeable pages with dots and optional auto-advance).
 
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
@@ -59,6 +68,14 @@
 - `AndroidStorage` and `FileStorage` no longer read from disk in their constructors.
 - The purchase retry queue holds at most 100 purchases and drops ones older than 30 days.
 
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
