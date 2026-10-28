@@ -50,6 +50,7 @@ import com.revnix.BlockPackage
 import com.revnix.PaywallBlockDoc
 import com.revnix.PaywallConfig
 import com.revnix.REVNIX_PREVIEW_PLACEMENT_KEY
+import com.revnix.PaywallProductShown
 import com.revnix.RevnixClient
 import com.revnix.RevnixPaywallEvent
 import com.revnix.localized
@@ -380,7 +381,16 @@ public class RevnixPaywallView @JvmOverloads constructor(
         if (client != null && !disableViewTracking) {
             // Fire-and-forget; the client swallows failures into diagnostics
             // and dispatches to IO internally.
-            viewReport = viewScope.async { client.logPaywallDisplay(placementKey, paywallId, decisionId = decisionId) }
+            viewReport = viewScope.async {
+                client.logPaywallDisplay(
+                    placementKey,
+                    paywallId,
+                    decisionId = decisionId,
+                    productsShown = shownPackages.mapNotNull { p ->
+                        p.productId?.let { PaywallProductShown(it, p.priceLabel, p.amountMinor, p.currency) }
+                    },
+                )
+            }
             // REV-263: an offering with nothing to sell is the one failure the
             // view can see by itself, and the one most worth knowing about —
             // the paywall painted, the customer could not buy.

@@ -34,6 +34,14 @@ public enum class RevnixStore {
 
 // ——— GET /v1/customers/{id}/entitlements ———
 
+/** One product row a paywall displayed; sent as `productsShown` on the display beacon (at most 20 entries, labels cut to 64 characters). */
+public data class PaywallProductShown(
+    val productId: String,
+    val priceLabel: String? = null,
+    val amountMinor: Long? = null,
+    val currency: String? = null,
+)
+
 @Serializable
 public data class EntitlementSource(
     val kind: String,

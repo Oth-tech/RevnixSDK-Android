@@ -29,6 +29,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
@@ -350,13 +351,29 @@ public class RevnixClient(private val config: RevnixConfig) {
         }
     }
 
-    public suspend fun logPaywallShown(placementKey: String?, paywallId: String?) {
+    public suspend fun logPaywallShown(
+        placementKey: String?,
+        paywallId: String?,
+        productsShown: List<PaywallProductShown>? = null,
+    ) {
         val body = buildJsonObject {
             put("customerId", JsonPrimitive(customerId()))
             put("viewId", JsonPrimitive(generateAnonymousId().removePrefix("rvx_anon_")))
             put("sdkVersion", JsonPrimitive(SDK_VERSION))
             placementKey?.let { put("placementKey", JsonPrimitive(it)) }
             paywallId?.let { put("paywallId", JsonPrimitive(it)) }
+            productsShown?.takeIf { it.isNotEmpty() }?.let { list ->
+                put("productsShown", buildJsonArray {
+                    list.take(20).forEach { p ->
+                        add(buildJsonObject {
+                            put("productId", JsonPrimitive(p.productId))
+                            p.priceLabel?.let { put("priceLabel", JsonPrimitive(it.take(64))) }
+                            p.amountMinor?.let { put("amountMinor", JsonPrimitive(it)) }
+                            p.currency?.let { put("currency", JsonPrimitive(it)) }
+                        })
+                    }
+                })
+            }
         }
         try {
             request(HttpMethod.Post, listOf("v1", "paywalls", "viewed"), body)

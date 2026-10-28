@@ -44,6 +44,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -812,6 +813,7 @@ public class RevnixClient internal constructor(
         screenIndex: Int? = null,
         blockId: String? = null,
         durationMs: Long? = null,
+        productsShown: List<PaywallProductShown>? = null,
     ): String {
         val viewId = UUID.randomUUID().toString().lowercase()
         if (placementKey == REVNIX_PREVIEW_PLACEMENT_KEY) return viewId
@@ -838,6 +840,18 @@ public class RevnixClient internal constructor(
             screenIndex?.let { put("screenIndex", JsonPrimitive(it)) }
             blockId?.let { put("blockId", JsonPrimitive(it)) }
             durationMs?.let { put("durationMs", JsonPrimitive(it)) }
+            productsShown?.takeIf { it.isNotEmpty() }?.let { list ->
+                put("productsShown", buildJsonArray {
+                    list.take(20).forEach { p ->
+                        add(buildJsonObject {
+                            put("productId", JsonPrimitive(p.productId))
+                            p.priceLabel?.let { put("priceLabel", JsonPrimitive(it.take(64))) }
+                            p.amountMinor?.let { put("amountMinor", JsonPrimitive(it)) }
+                            p.currency?.let { put("currency", JsonPrimitive(it)) }
+                        })
+                    }
+                })
+            }
         }
         try {
             request("POST", listOf("v1", "paywalls", "viewed"), body)

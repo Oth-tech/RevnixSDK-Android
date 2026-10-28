@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Optional `productsShown` on `logPaywallDisplay` (and the KMP `logPaywallShown`): a list of `PaywallProductShown(productId, priceLabel, amountMinor, currency)` for the products the paywall displayed, sent with the display beacon. At most 20 entries are sent and labels are cut to 64 characters; `RevnixPaywallView` fills it from the packages that carry a `productId`.
+
 ## 1.10.0 (2026-10-24)
 
 ### Changed

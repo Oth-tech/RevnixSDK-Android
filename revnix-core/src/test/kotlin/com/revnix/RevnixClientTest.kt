@@ -1921,6 +1921,34 @@ class RevnixClientTest {
     }
 
     @Test
+    fun `paywall display carries productsShown only when given, capped at 20 entries and 64-char labels`() = runBlocking {
+        route("/paywalls/viewed" to { json(200, "{}") })
+        val client = makeClient()
+
+        client.logPaywallDisplay("p", "pw", productsShown = listOf(
+            PaywallProductShown("m", "$9.99", 999, "USD"),
+            PaywallProductShown("y"),
+        ))
+        val two = Json.parseToJsonElement(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8()).jsonObject
+        val rows = two["productsShown"]!!.jsonArray
+        assertEquals(2, rows.size)
+        assertEquals("m", rows[0].jsonObject["productId"]!!.jsonPrimitive.content)
+        assertEquals("$9.99", rows[0].jsonObject["priceLabel"]!!.jsonPrimitive.content)
+        assertEquals(999L, rows[0].jsonObject["amountMinor"]!!.jsonPrimitive.long)
+        assertEquals("USD", rows[0].jsonObject["currency"]!!.jsonPrimitive.content)
+        assertEquals(setOf("productId"), rows[1].jsonObject.keys)
+
+        client.logPaywallDisplay("p", "pw")
+        val bare = Json.parseToJsonElement(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8()).jsonObject
+        assertFalse("productsShown" in bare)
+
+        client.logPaywallDisplay("p", "pw", productsShown = List(25) { PaywallProductShown("p$it", "x".repeat(80)) })
+        val capped = Json.parseToJsonElement(server.takeRequest(2, java.util.concurrent.TimeUnit.SECONDS)!!.body.readUtf8()).jsonObject["productsShown"]!!.jsonArray
+        assertEquals(20, capped.size)
+        assertEquals(64, capped[0].jsonObject["priceLabel"]!!.jsonPrimitive.content.length)
+    }
+
+    @Test
     fun `logAdRevenue posts the beacon, and zero revenue sends nothing`() = runBlocking {
         route("v1/ad-revenue" to { json(200, "{}") })
         val client = makeClient()
