@@ -13,7 +13,7 @@
 ### Changed
 
 - Entitlement cache is signed. The server signs each `GET /v1/customers/{customerId}/entitlements` 200 (ECDSA P-256 / SHA-256, `Revnix-Signed-At` and `Revnix-Signature` headers, bound to the API key and customer id). The SDK pins Revnix's public keys and only trusts a cached snapshot whose signature verifies for its own API key and customer; a tampered, legacy or foreign snapshot is treated as no cache. Cache age comes from the signed server time, so editing the stored time cannot extend the 30 s soft TTL or the 14-day offline window. A 200 without signature headers is returned but not cached, and drops an older cached entry. After upgrading, the first offline launch has no cached entitlements until one online read, and an offline cache needs the server to sign. This stops edits to the cache file, not a user who patches the app binary on a rooted or jailbroken device.
-- Queued analytics events are kept in memory and written to disk at most once a second, immediately when the app goes to the background or `close()` is called and after each flush, instead of rewriting the whole storage file on every event. A crash within that second can lose those events. The purchase retry queue is still written immediately.
+- Queued analytics events are kept in memory and written to disk at most once a second, immediately when the app goes to the background (only with `lifecycle` configured) or `close()` is called and after each flush, instead of rewriting the whole storage file on every event. A crash within that second can lose those events. The purchase retry queue is still written immediately.
 
 ## 1.9.0 (2026-10-22)
 ## 1.9.0 (2026-10-22)
@@ -82,7 +82,7 @@
 
 ### Changed
 
-- `track` and `logPaywallEvent` queue events on device and send them in batches of up to 100 (at 20 queued, 10 s after an event, on app background, and after launch), so offline events are no longer lost. The queue holds at most 1000 events.
+- `track` and `logPaywallEvent` queue events on device and send them in batches of up to 100 (at 20 queued, 10 s after an event, on app background when `lifecycle` is configured, and after launch), so offline events are no longer lost. The queue holds at most 1000 events.
 - `resolvePlacement` answers from a cache up to 24 h old for the same customer and refreshes it in the background.
 - Paywall images are cached on disk under the app's cache directory.
 - Entitlements with a cached snapshot wait at most 3 s for the network; HTTP connects time out after 5 s.

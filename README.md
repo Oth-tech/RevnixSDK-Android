@@ -70,6 +70,7 @@ val client = RevnixClient(
         // version, debuggable flag and the deviceKey reinstall detection
         // needs. Pass null to send nothing.
         device = AndroidDeviceFacts.detect(context),
+        lifecycle = AndroidLifecycle(application),
     )
 )
 

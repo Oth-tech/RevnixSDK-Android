@@ -4,7 +4,7 @@
 
 Please do not open a public issue for a security problem.
 
-Email **security@revnix.dev** with:
+Email **security@revnix.io** with:
 
 - what you found and where (this SDK, the Revnix API, or the dashboard)
 - the steps or code to reproduce it
