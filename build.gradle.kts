@@ -11,7 +11,7 @@ plugins {
 
 allprojects {
     group = "io.revnix"
-    version = "1.11.0"
+    version = "2.0.0"
 }
 
 subprojects {

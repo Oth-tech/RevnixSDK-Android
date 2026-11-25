@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 2.0.0 (2026-11-25)
+
+No SDK changes. Version moved in lockstep with revnix-app release 55ceaf4; the package contents are identical to 1.11.0.
+
 ## 1.11.0 (2026-10-29)
 
 ### Added
@@ -9,12 +13,15 @@
 - Optional `productsShown` on `logPaywallDisplay` (and the KMP `logPaywallShown`): a list of `PaywallProductShown(productId, priceLabel, amountMinor, currency)` for the products the paywall displayed, sent with the display beacon. At most 20 entries are sent and labels are cut to 64 characters; `RevnixPaywallView` fills it from the packages that carry a `productId`.
 
 ## 1.10.0 (2026-10-24)
+## 1.10.0 (2026-10-24)
 
 ### Changed
 
 - Entitlement cache is signed. The server signs each `GET /v1/customers/{customerId}/entitlements` 200 (ECDSA P-256 / SHA-256, `Revnix-Signed-At` and `Revnix-Signature` headers, bound to the API key and customer id). The SDK pins Revnix's public keys and only trusts a cached snapshot whose signature verifies for its own API key and customer; a tampered, legacy or foreign snapshot is treated as no cache. Cache age comes from the signed server time, so editing the stored time cannot extend the 30 s soft TTL or the 14-day offline window. A 200 without signature headers is returned but not cached, and drops an older cached entry. After upgrading, the first offline launch has no cached entitlements until one online read, and an offline cache needs the server to sign. This stops edits to the cache file, not a user who patches the app binary on a rooted or jailbroken device.
 - Queued analytics events are kept in memory and written to disk at most once a second, immediately when the app goes to the background (only with `lifecycle` configured) or `close()` is called and after each flush, instead of rewriting the whole storage file on every event. A crash within that second can lose those events. The purchase retry queue is still written immediately.
 
+## 1.9.0 (2026-10-22)
+## 1.9.0 (2026-10-22)
 ## 1.9.0 (2026-10-22)
 ## 1.9.0 (2026-10-22)
 
@@ -40,11 +47,23 @@
 ## 1.8.0 (2026-10-14)
 ## 1.8.0 (2026-10-14)
 ## 1.8.0 (2026-10-14)
+## 1.8.0 (2026-10-14)
+## 1.8.0 (2026-10-14)
+## 1.8.0 (2026-10-14)
+## 1.8.0 (2026-10-14)
 
 ### Added
 
 - Paywall blocks: onboarding `screens` shown before the paywall, with `next` / `back` actions on text, image and button blocks and progress dots while an onboarding screen is showing.
 
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
+## 1.7.0 (2026-10-13)
 ## 1.7.0 (2026-10-13)
 ## 1.7.0 (2026-10-13)
 ## 1.7.0 (2026-10-13)
@@ -75,6 +94,22 @@
 ## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
 ## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
+## 1.6.0 (2026-10-12)
 
 ### Added
 
@@ -89,6 +124,38 @@
 - `AndroidStorage` and `FileStorage` no longer read from disk in their constructors.
 - The purchase retry queue holds at most 100 purchases and drops ones older than 30 days.
 
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
+## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
 ## 1.5.0 (2026-10-09)
