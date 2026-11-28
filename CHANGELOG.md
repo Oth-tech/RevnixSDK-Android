@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Ship this release after the Revnix server signs entitlement responses (`ENTITLEMENT_SIGNING_KEY` set on the deployment). Against an unsigned server every entitlement read fails.
+
+### Changed
+
+- A live `GET /v1/customers/{id}/entitlements` response with a missing or invalid `Revnix-Signature` is now rejected as a retryable `RevnixError.BadResponse` instead of being returned. The last verified cached snapshot serves (within the offline window); with no cache the call throws and `isEntitled` is false. A rejected response is never stored and never removes the verified cache. `waitForEntitlements` never resolves on an unsigned response.
+
 ## 2.0.0 (2026-11-25)
 
 No SDK changes. Version moved in lockstep with revnix-app release 55ceaf4; the package contents are identical to 1.11.0.

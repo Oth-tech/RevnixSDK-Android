@@ -334,15 +334,14 @@ public class RevnixClient internal constructor(
         val raw = request("GET", listOf("v1", "customers", cid, "entitlements"), timeoutMs = timeoutMs) {
             headers = it
         }
-        val snapshot = decode(CustomerEntitlements.serializer(), raw)
-            .copy(stale = false, fetchedAt = nowMs)
         val signedAt = headers?.get("Revnix-Signed-At")
         val signature = headers?.get("Revnix-Signature")
-        if (signedAt != null && signature != null) {
-            storeCacheEntry(SignedCacheEntry(raw, signedAt, signature, nowMs), cid)
-        } else {
-            config.storage.remove(cacheKey(cid))
+        if (signedAt == null || signature == null || !isValidSignature(raw, signedAt, signature, cid)) {
+            throw RevnixError.BadResponse("unsigned or invalid entitlements signature")
         }
+        val snapshot = decode(CustomerEntitlements.serializer(), raw)
+            .copy(stale = false, fetchedAt = nowMs)
+        storeCacheEntry(SignedCacheEntry(raw, signedAt, signature, nowMs), cid)
         return snapshot
     }
 
@@ -1740,21 +1739,25 @@ public class RevnixClient internal constructor(
     private fun verifyCacheEntry(cid: String, raw: String): CacheEntry? {
         val entry = runCatching { json.decodeFromString(SignedCacheEntry.serializer(), raw) }.getOrNull() ?: return null
         val signedAt = entry.signedAt.toLongOrNull() ?: return null
-        val signature = entry.signature.decodeBase64()?.toByteArray() ?: return null
-        val message = "${entry.signedAt}.$apiKeyHash.${sha256Hex(cid)}.${entry.body}".toByteArray(Charsets.UTF_8)
-        val verified = entitlementKeys.any { key ->
+        if (!isValidSignature(entry.body, entry.signedAt, entry.signature, cid)) return null
+        val snapshot = runCatching { json.decodeFromString(CustomerEntitlements.serializer(), entry.body) }
+            .getOrNull() ?: return null
+        return CacheEntry(snapshot, minOf(entry.fetchedAt, signedAt))
+    }
+
+    private fun isValidSignature(body: String, signedAt: String, signature: String, cid: String): Boolean {
+        if (signedAt.toLongOrNull() == null) return false
+        val der = signature.decodeBase64()?.toByteArray() ?: return false
+        val message = "$signedAt.$apiKeyHash.${sha256Hex(cid)}.$body".toByteArray(Charsets.UTF_8)
+        return entitlementKeys.any { key ->
             runCatching {
                 Signature.getInstance("SHA256withECDSA").run {
                     initVerify(key)
                     update(message)
-                    verify(signature)
+                    verify(der)
                 }
             }.getOrDefault(false)
         }
-        if (!verified) return null
-        val snapshot = runCatching { json.decodeFromString(CustomerEntitlements.serializer(), entry.body) }
-            .getOrNull() ?: return null
-        return CacheEntry(snapshot, minOf(entry.fetchedAt, signedAt))
     }
 
     private fun storeCacheEntry(entry: SignedCacheEntry, cid: String) {

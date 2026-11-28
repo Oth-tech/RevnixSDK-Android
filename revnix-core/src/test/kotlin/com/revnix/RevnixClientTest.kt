@@ -410,66 +410,82 @@ class RevnixClientTest {
         assertEquals(false, served.entitlements.first().isActive)
     }
 
-    @Test
-    fun `a response without signature headers is returned but never cached`() = runBlocking {
-        route("/entitlements" to {
-            MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(entitlementsBody)
-        })
-        val storage = MemoryStorage()
-        val client = makeClient(storage = storage)
+    private fun unsigned() =
+        MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(entitlementsBody)
 
-        assertEquals(7L, client.entitlements().cursor)
-        assertNull(storage.get("revnix.ent.${client.customerId()}"))
-        assertNull(client.cachedEntitlements())
-    }
+    private fun strangerKey() = KeyPairGenerator.getInstance("EC")
+        .apply { initialize(ECGenParameterSpec("secp256r1")) }
+        .generateKeyPair().private
 
-    @Test
-    fun `an unsigned read drops the older signed entry`() = runBlocking {
-        route("/entitlements" to { json(200, entitlementsBody) })
+    private fun assertLiveRejected(bad: (RecordedRequest) -> MockResponse) = runBlocking {
+        route("/entitlements" to { bad(it) })
+        val emptyStorage = MemoryStorage()
+        val noCache = makeClient(storage = emptyStorage)
+        assertFailsWith<RevnixError.BadResponse> { noCache.entitlements() }
+        assertNull(emptyStorage.get("revnix.ent.${noCache.customerId()}"))
+        assertNull(noCache.cachedEntitlements())
+
+        val calls = AtomicInteger(0)
+        route("/entitlements" to { if (calls.getAndIncrement() == 0) json(200, entitlementsBody) else bad(it) })
         val storage = MemoryStorage()
         val client = makeClient(storage = storage, entitlementsTtl = Duration.ZERO)
         client.entitlements()
-        assertNotNull(storage.get("revnix.ent.${client.customerId()}"))
+        val key = "revnix.ent.${client.customerId()}"
+        val before = storage.get(key)
+        val served = client.entitlements()
+        assertEquals(true, served.stale)
+        assertEquals(true, served.entitlements.first().isActive)
+        assertEquals(before, storage.get(key))
+        assertNotNull(client.cachedEntitlements())
+    }
 
-        route("/entitlements" to {
-            MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(entitlementsBody)
-        })
-        client.entitlements()
+    @Test
+    fun `a response without signature headers is rejected and never cached`() = runBlocking {
+        route("/entitlements" to { unsigned() })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage)
+
+        assertFailsWith<RevnixError.BadResponse> { client.entitlements() }
         assertNull(storage.get("revnix.ent.${client.customerId()}"))
-    }
-
-    @Test
-    fun `a snapshot signed by an unpinned key is rejected`() = runBlocking {
-        val stranger = KeyPairGenerator.getInstance("EC")
-            .apply { initialize(ECGenParameterSpec("secp256r1")) }
-            .generateKeyPair()
-        route("/entitlements" to {
-            json(200, entitlementsBody, signatureHeaders(entitlementsBody, entitlementsCid(it), key = stranger.private))
-        })
-        val client = makeClient()
-
-        assertEquals(false, client.entitlements().stale)
         assertNull(client.cachedEntitlements())
     }
 
     @Test
-    fun `a snapshot signed for another customer is rejected`() = runBlocking {
-        route("/entitlements" to { json(200, entitlementsBody, signatureHeaders(entitlementsBody, "someone_else")) })
-        val client = makeClient()
+    fun `an unsigned read keeps the older signed entry and serves it stale`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody)) { unsigned() })
+        val storage = MemoryStorage()
+        val client = makeClient(storage = storage, entitlementsTtl = Duration.ZERO)
+        client.entitlements()
+        val key = "revnix.ent.${client.customerId()}"
+        val before = storage.get(key)
+        assertNotNull(before)
 
-        assertEquals(false, client.entitlements().stale)
-        assertNull(client.cachedEntitlements())
+        val served = client.entitlements()
+        assertEquals(true, served.stale)
+        assertEquals(before, storage.get(key))
     }
 
     @Test
-    fun `a snapshot signed for another api key is rejected`() = runBlocking {
-        route("/entitlements" to {
+    fun `a live response with a tampered body is rejected`() {
+        assertLiveRejected { json(200, entitlementsBody(1L), signatureHeaders(entitlementsBody, entitlementsCid(it))) }
+    }
+
+    @Test
+    fun `a live response signed by an unpinned key is rejected`() {
+        val stranger = strangerKey()
+        assertLiveRejected { json(200, entitlementsBody, signatureHeaders(entitlementsBody, entitlementsCid(it), key = stranger)) }
+    }
+
+    @Test
+    fun `a live response signed for another customer is rejected`() {
+        assertLiveRejected { json(200, entitlementsBody, signatureHeaders(entitlementsBody, "someone_else")) }
+    }
+
+    @Test
+    fun `a live response signed for another api key is rejected`() {
+        assertLiveRejected {
             json(200, entitlementsBody, signatureHeaders(entitlementsBody, entitlementsCid(it), apiKey = "rvx_pk_test_other"))
-        })
-        val client = makeClient()
-
-        assertEquals(false, client.entitlements().stale)
-        assertNull(client.cachedEntitlements())
+        }
     }
 
     @Test
@@ -1350,6 +1366,15 @@ class RevnixClientTest {
         val settled = client.waitForEntitlements(9)
         assertEquals(9L, settled.cursor)
         assertEquals(false, settled.stale)
+    }
+
+    @Test
+    fun `waitForEntitlements does not resolve on an unsigned response`() = runBlocking {
+        route("/entitlements" to onceThen(json(200, entitlementsBody)) {
+            unsigned().setBody(entitlementsBody.replace("\"cursor\":7", "\"cursor\":9"))
+        })
+        val client = makeClient(readYourWritesDelays = listOf(10.milliseconds, 10.milliseconds))
+        assertEquals(7L, client.waitForEntitlements(9).cursor)
     }
 
     @Test
